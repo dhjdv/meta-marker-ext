@@ -1,0 +1,1487 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Metashape Marker Extractor & GCS Converter</title>
+    
+    <!-- 1. Styles -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+        
+        body { font-family: 'Inter', sans-serif; }
+        
+        /* Custom scrollbar for better UX */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: #f8fafc; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        
+        .custom-div-icon { background: transparent; border: none; }
+        
+        /* Map Container Styling */
+        .leaflet-container {
+            font-family: 'Inter', sans-serif;
+            background: #f8fafc;
+        }
+        
+        /* Popup Styling Override */
+        .leaflet-popup-content-wrapper {
+            border-radius: 8px;
+            box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1);
+        }
+        .leaflet-popup-content {
+            margin: 0;
+            line-height: 1.5;
+        }
+    </style>
+
+    <!-- 2. Core Libraries -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- 3. Utility Libraries -->
+    <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/xlsx-js-style@1.2.0/dist/xlsx.bundle.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/proj4js/2.9.0/proj4.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf/turf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased selection:bg-indigo-100 selection:text-indigo-900">
+
+    <div id="root"></div>
+
+    <!-- 4. The Application Logic -->
+    <script type="text/babel" data-type="module">
+        import { 
+            Upload, FileText, Download, AlertCircle, MapPin, Database, Trash2, 
+            CheckCircle, Info, Layers, LayoutGrid, List, Settings, Globe, Box, 
+            ScanLine, FileSearch, Sliders, ArrowLeftRight, ArrowUpDown, BoxSelect, 
+            Shield, ShieldAlert, Sparkles, Filter, Compass, Move3d, Ruler, FileDigit, Grip,
+            Edit2, Check, X, Combine, Square, CheckSquare, Microscope, MousePointerClick,
+            ArrowUp, ArrowDown, XCircle, FileCode, ChevronUp, ChevronDown, PieChart, Activity,
+            History, RotateCcw, Copy, FileSpreadsheet, ArrowRight, Map as MapIcon, Scale, FileCheck, 
+            Layers as LayersIcon, FileStack, FolderOpen, Package, Files, ListChecks, ChevronRight, Eye, Ban, Undo2, Layout, Plus, Users
+        } from 'https://esm.sh/lucide-react@0.263.1?deps=react@18.2.0';
+
+        const { useState, useCallback, useEffect, useMemo, useRef } = React;
+
+        // --- Constants ---
+        const WGS84_WKT = 'GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["Degree",0.017453292519943295]]';
+
+        // --- Custom Shapefile Writer (Native Implementation with UTF-8 Support) ---
+        const writePointShapefile = (points, geometryType) => {
+            const encoder = new TextEncoder(); 
+
+            const writeString = (view, offset, str, length) => {
+                const bytes = encoder.encode(str);
+                for (let i = 0; i < length; i++) {
+                    view.setUint8(offset + i, i < bytes.length ? bytes[i] : 0);
+                }
+            };
+
+            const numPoints = points.length;
+            const shpHeaderLen = 100;
+            const shpRecordLen = 28; 
+            const shpTotalLen = shpHeaderLen + numPoints * shpRecordLen;
+            const shxTotalLen = shpHeaderLen + numPoints * 8;
+
+            const shpBuf = new ArrayBuffer(shpTotalLen);
+            const shxBuf = new ArrayBuffer(shxTotalLen);
+            const shpView = new DataView(shpBuf);
+            const shxView = new DataView(shxBuf);
+
+            let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+            points.forEach(p => {
+                if (p.x < minX) minX = p.x;
+                if (p.y < minY) minY = p.y;
+                if (p.x > maxX) maxX = p.x;
+                if (p.y > maxY) maxY = p.y;
+            });
+
+            [shpView, shxView].forEach(view => {
+                view.setInt32(0, 9994); 
+                view.setInt32(28, 1000, true); 
+                view.setInt32(32, 1, true); 
+                view.setFloat64(36, minX, true);
+                view.setFloat64(44, minY, true);
+                view.setFloat64(52, maxX, true);
+                view.setFloat64(60, maxY, true);
+            });
+            shpView.setInt32(24, shpTotalLen / 2); 
+            shxView.setInt32(24, shxTotalLen / 2);
+
+            let offset = 100;
+            points.forEach((p, i) => {
+                shpView.setInt32(offset, i + 1); 
+                shpView.setInt32(offset + 4, 10); 
+                shpView.setInt32(offset + 8, 1, true); 
+                shpView.setFloat64(offset + 12, p.x, true);
+                shpView.setFloat64(offset + 20, p.y, true);
+
+                shxView.setInt32(100 + i * 8, offset / 2); 
+                shxView.setInt32(100 + i * 8 + 4, 10); 
+
+                offset += 28;
+            });
+
+            const fields = [
+                { name: "LABEL", type: "C", size: 50 },
+                { name: geometryType === 'GCS' ? "LATITUDE" : "EASTING", type: "C", size: 20 },
+                { name: geometryType === 'GCS' ? "LONGITUDE" : "NORTHING", type: "C", size: 20 },
+                { name: "ELEV_Z", type: "C", size: 20 },
+                { name: "GROUP", type: "C", size: 50 },
+                { name: "NOTE", type: "C", size: 100 }
+            ];
+
+            const headerSize = 32 + fields.length * 32 + 1;
+            const recordSize = 1 + fields.reduce((sum, f) => sum + f.size, 0);
+            const dbfTotalLen = headerSize + numPoints * recordSize + 1; 
+
+            const dbfBuf = new ArrayBuffer(dbfTotalLen);
+            const dbfView = new DataView(dbfBuf);
+
+            dbfView.setUint8(0, 0x03); 
+            const date = new Date();
+            dbfView.setUint8(1, date.getFullYear() - 1900);
+            dbfView.setUint8(2, date.getMonth() + 1);
+            dbfView.setUint8(3, date.getDate());
+            dbfView.setUint32(4, numPoints, true);
+            dbfView.setUint16(8, headerSize, true);
+            dbfView.setUint16(10, recordSize, true);
+            
+            fields.forEach((f, i) => {
+                const fOffset = 32 + i * 32;
+                writeString(dbfView, fOffset, f.name, 11);
+                dbfView.setUint8(fOffset + 11, f.type.charCodeAt(0));
+                dbfView.setUint8(fOffset + 16, f.size);
+            });
+            dbfView.setUint8(headerSize - 1, 0x0D); 
+
+            points.forEach((p, i) => {
+                let rOffset = headerSize + i * recordSize;
+                dbfView.setUint8(rOffset, 0x20); 
+                rOffset++;
+
+                const values = [
+                    p.label,
+                    p.val1, 
+                    p.val2, 
+                    p.z,
+                    p.group,
+                    p.note
+                ];
+
+                values.forEach((val, idx) => {
+                    const field = fields[idx];
+                    writeString(dbfView, rOffset, String(val || ""), field.size);
+                    rOffset += field.size;
+                });
+            });
+            
+            dbfView.setUint8(dbfTotalLen - 1, 0x1A); 
+
+            return { shp: shpBuf, shx: shxBuf, dbf: dbfBuf };
+        };
+
+
+        // --- Parsers ---
+        const parsePRJFull = (text) => {
+            const extract = (regex) => {
+                const match = text.match(regex);
+                return match ? match[1] : null;
+            };
+            return {
+                name: extract(/(?:PROJCS|GEOGCS)\["([^"]+)"/),
+                datum: extract(/DATUM\["([^"]+)"/),
+                projection: extract(/PROJECTION\["([^"]+)"/),
+                authority: extract(/AUTHORITY\["([^"]+)","([^"]+)"\]/),
+                unit: extract(/UNIT\["([^"]+)"/),
+                wkt: text
+            };
+        };
+
+        const parseDXFAdvanced = (text) => {
+            const lines = text.split(/\r\n|\r|\n/);
+            const entities = [];
+            const layers = {}; 
+            const header = { insUnits: null, version: null };
+            let currentSection = null;
+            let currentEntity = null;
+            const pFloat = (v) => parseFloat(v);
+            const pInt = (v) => parseInt(v, 10);
+            
+            const trackLayer = (layerName, type) => {
+                if (!layerName) layerName = '0';
+                if (!layers[layerName]) layers[layerName] = { points: 0, texts: 0, inserts: 0, total: 0 };
+                layers[layerName].total++;
+                if (type === 'POINT') layers[layerName].points++;
+                if (type === 'TEXT' || type === 'MTEXT') layers[layerName].texts++;
+                if (type === 'INSERT') layers[layerName].inserts++;
+            };
+            
+            const pushEntity = (ent) => {
+                if (ent && ent.props.layer) {
+                    entities.push(ent);
+                    trackLayer(ent.props.layer, ent.type);
+                }
+            };
+
+            for (let i = 0; i < lines.length; i++) {
+                const code = lines[i].trim();
+                const value = lines[i + 1] ? lines[i + 1].trim() : "";
+                if (code === '0' && value === 'SECTION') {
+                    const nextCode = lines[i+2]?.trim();
+                    const nextVal = lines[i+3]?.trim();
+                    if (nextCode === '2') { currentSection = nextVal; i += 3; continue; }
+                }
+                if (code === '0' && value === 'ENDSEC') currentSection = null;
+                if (currentSection === 'HEADER') {
+                    if (code === '9') {
+                        // skip
+                    } else {
+                        if (lines[i-1]?.trim() === '$INSUNITS' && code === '70') header.insUnits = pInt(value);
+                    }
+                }
+                if (currentSection === 'ENTITIES') {
+                    if (code === '0') {
+                        if (currentEntity) pushEntity(currentEntity);
+                        if (['POINT', 'TEXT', 'MTEXT', 'INSERT', 'ATTRIB'].includes(value)) {
+                            currentEntity = { type: value, props: { layer: '0' } };
+                        } else { currentEntity = null; }
+                    } 
+                    else if (currentEntity) {
+                        switch (code) {
+                            case '8': currentEntity.props.layer = value; break;
+                            case '10': currentEntity.props.x = pFloat(value); break;
+                            case '20': currentEntity.props.y = pFloat(value); break;
+                            case '30': currentEntity.props.z = pFloat(value); break;
+                            case '1': currentEntity.props.text = value; break;
+                            case '2': currentEntity.props.blockName = value; break;
+                            default: break;
+                        }
+                    }
+                }
+                i++;
+            }
+            if (currentEntity) pushEntity(currentEntity);
+            return { entities, layers, header };
+        };
+
+        const readFileAsText = (file) => {
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = (e) => resolve(e.target.result);
+                reader.onerror = (e) => reject(e);
+                reader.readAsText(file);
+            });
+        };
+
+        const stringToColor = (str) => {
+            let hash = 0;
+            for (let i = 0; i < str.length; i++) {
+                hash = str.charCodeAt(i) + ((hash << 5) - hash);
+            }
+            const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
+            return '#' + '00000'.substring(0, 6 - c.length) + c;
+        };
+
+        const MapPreview = ({ points }) => {
+            if (!points || points.length === 0) return <div className="h-[400px] bg-slate-100 flex items-center justify-center text-slate-400">No Data to Map</div>;
+            
+            const xs = points.map(p => p.x); 
+            const ys = points.map(p => p.y);
+            const minX = Math.min(...xs); 
+            const maxX = Math.max(...xs); 
+            const minY = Math.min(...ys); 
+            const maxY = Math.max(...ys); 
+            const rangeX = (maxX - minX) || 1; 
+            const rangeY = (maxY - minY) || 1;
+            
+            const getPos = (p) => ({ 
+                x: ((p.x - minX) / rangeX) * 100, 
+                y: 100 - ((p.y - minY) / rangeY) * 100 
+            });
+
+            return (
+                <div className="w-full h-[500px] bg-slate-900 rounded-lg relative overflow-hidden group border border-slate-700 shadow-inner">
+                    <div className="absolute top-4 right-4 bg-white/90 backdrop-blur rounded-lg p-3 text-slate-600 text-xs border border-slate-200 z-10 shadow-sm">
+                        <div className="flex items-center gap-2 mb-1"><Compass size={14} className="text-red-500" /> North is Up (Y+)</div>
+                        <div className="flex items-center gap-2"><ArrowLeftRight size={14} className="text-blue-500" /> East is Right (X+)</div>
+                    </div>
+                    <div className="absolute inset-0 opacity-10 pointer-events-none" style={{backgroundImage: 'radial-gradient(circle, #475569 1px, transparent 1px)', backgroundSize: '30px 30px'}}></div>
+                    {points.map(p => { 
+                        const pos = getPos(p); 
+                        return (
+                            <div 
+                                key={p.id} 
+                                className="absolute w-2.5 h-2.5 bg-blue-500 rounded-full hover:bg-white hover:scale-150 transition-all cursor-pointer shadow-md border border-white/50" 
+                                style={{left: `${pos.x}%`, top: `${pos.y}%`}} 
+                                title={`${p.name} (Z: ${(p.z || 0).toFixed(2)})`} 
+                            />
+                        ) 
+                    })}
+                </div>
+            )
+        };
+
+        // --- MAIN APP COMPONENT ---
+        function App() {
+            // --- State ---
+            const [appStep, setAppStep] = useState('pcs'); 
+            const [dxfFile, setDxfFile] = useState(null); 
+            const [rawEntities, setRawEntities] = useState([]); 
+            const [prjData, setPrjData] = useState(null);
+            const [prjInputMode, setPrjInputMode] = useState('file');
+            const [manualPrjText, setManualPrjText] = useState('');
+
+            const [extractedPoints, setExtractedPoints] = useState([]);
+            const [layerStats, setLayerStats] = useState([]);
+            const [dxfHeader, setDxfHeader] = useState({});
+            const [extractionStats, setExtractionStats] = useState({ 
+                used: { attributes: 0, textLabels: 0, blockNames: 0, layers: 0, autoIds: 0 },
+                total: { attributes: 0, textLabels: 0, blockNames: 0, points: 0 }
+            });
+
+            const [convertedPoints, setConvertedPoints] = useState([]);
+
+            const [groupingFiles, setGroupingFiles] = useState([]); 
+            const [pointGroups, setPointGroups] = useState({}); 
+            const [groupPolygons, setGroupPolygons] = useState({}); 
+            const [permanentSelection, setPermanentSelection] = useState({}); 
+            const [excludedSelection, setExcludedSelection] = useState({});
+            const [isLibsReady, setIsLibsReady] = useState(true); 
+            const mapRef = useRef(null); 
+            const [expandedGroups, setExpandedGroups] = useState(new Set()); 
+
+            const [isProcessing, setIsProcessing] = useState(false);
+            const [error, setError] = useState(null);
+            const [viewMode, setViewMode] = useState('groups'); // Defaults to groups, will auto-switch if empty
+            const [showConfigPanel, setShowConfigPanel] = useState(false);
+            const [showAdvanced, setShowAdvanced] = useState(false);
+            const [showNamingLogic, setShowNamingLogic] = useState(true);
+            
+            const [selectedIds, setSelectedIds] = useState(new Set());
+            const [editingId, setEditingId] = useState(null);
+            const [editForm, setEditForm] = useState({});
+            const [manualChangesCount, setManualChangesCount] = useState(0); 
+            const [isMergeModalOpen, setIsMergeModalOpen] = useState(false);
+            const [mergeCandidates, setMergeCandidates] = useState([]);
+            const [mergeSelection, setMergeSelection] = useState({ name: null, x: null, y: null, z: null, layer: null });
+            
+            const [sortConfig, setSortConfig] = useState({ key: null, direction: null });
+            const [activeStrategy, setActiveStrategy] = useState('smart'); 
+            const [strategyCache, setStrategyCache] = useState({}); 
+            const ignoreConsolidation = useRef(false);
+            const [restoredMessage, setRestoredMessage] = useState(null);
+            
+            const [namingPriority, setNamingPriority] = useState(['attribute', 'text', 'block', 'layer']);
+            const [exportPrecision, setExportPrecision] = useState(4);
+            const [isCustomGroupModalOpen, setIsCustomGroupModalOpen] = useState(false);
+            const [newGroupName, setNewGroupName] = useState('');
+            const [selectionForGroup, setSelectionForGroup] = useState(new Set()); 
+
+            const [mergeSettings, setMergeSettings] = useState({
+                precision: 3, ignoreZ: true, noMerge: false, useAttributes: true, useText: true, useBlockNames: true, 
+                useLayers: true, usePointCoords: true, useInsertCoords: true, useTextCoords: true, geomPriority: 'point', 
+                swapXY: false, invertZ: false
+            });
+
+            // Effect to set default view mode in stage 3
+            useEffect(() => {
+                if (appStep === 'map' && Object.keys(pointGroups).length === 0) {
+                    setViewMode('all');
+                }
+            }, [appStep, pointGroups]);
+
+            const getToleranceLabel = (p) => {
+                const val = Math.pow(10, -p);
+                if (val >= 1) return `~${val}m (Loose)`;
+                if (val >= 0.1) return `~${val*100}cm (Rough)`;
+                if (val >= 0.01) return `~${val*100}cm (Standard)`;
+                if (val >= 0.001) return `~${val*1000}mm (Precise)`;
+                return `~${val} units (Micro)`;
+            };
+
+            const toDMS = (deg, isLat) => {
+                if (deg === null || deg === undefined || isNaN(deg)) return "N/A";
+                const absolute = Math.abs(deg);
+                const degrees = Math.floor(absolute);
+                const minutesNotTruncated = (absolute - degrees) * 60;
+                const minutes = Math.floor(minutesNotTruncated);
+                
+                const secVal = (minutesNotTruncated - minutes) * 60;
+                const secText = secVal.toFixed(exportPrecision);
+                
+                const [secInt, secDec] = secText.split('.');
+                const paddedSeconds = secDec ? `${secInt.padStart(2, '0')}.${secDec}` : secInt.padStart(2, '0');
+
+                const direction = isLat ? (deg >= 0 ? "N" : "S") : (deg >= 0 ? "E" : "W");
+                const paddedDegrees = String(degrees).padStart(2, '0');
+                const paddedMinutes = String(minutes).padStart(2, '0');
+
+                return `${paddedDegrees}° ${paddedMinutes}' ${paddedSeconds}" ${direction}`;
+            };
+
+            const consolidateData = useCallback(() => {
+                if (ignoreConsolidation.current) { ignoreConsolidation.current = false; return; }
+                setSelectedIds(new Set()); setEditingId(null); setIsMergeModalOpen(false); setManualChangesCount(0); 
+                if (rawEntities.length === 0) return;
+                const totals = { attributes: 0, textLabels: 0, blockNames: 0, points: 0 };
+                rawEntities.forEach(e => { if(e.type === 'ATTRIB') totals.attributes++; if(e.type === 'TEXT' || e.type === 'MTEXT') totals.textLabels++; if(e.type === 'INSERT') totals.blockNames++; });
+
+                if (mergeSettings.noMerge) {
+                    const rawPoints = [];
+                    let autoId = 1;
+                    const rawUsage = { attributes: 0, textLabels: 0, blockNames: 0, layers: 0, autoIds: 0 };
+                    rawEntities.forEach((e, idx) => {
+                        if (e.type === 'POINT' && !mergeSettings.usePointCoords) return;
+                        if (e.type === 'INSERT' && !mergeSettings.useInsertCoords) return;
+                        if ((e.type === 'TEXT' || e.type === 'MTEXT') && !mergeSettings.useTextCoords) return;
+                        if (e.type === 'ATTRIB' && !mergeSettings.useAttributes) return;
+                        let name = "Unnamed"; let source = "Unknown"; let detail = "Raw Entity";
+                        if (e.type === 'POINT') { name = e.props.layer; source = "Layer"; detail="Point Entity"; rawUsage.layers++; }
+                        else if (e.type === 'TEXT' || e.type === 'MTEXT') { name = e.props.text; source = "Text"; detail="Text Label"; rawUsage.textLabels++; }
+                        else if (e.type === 'INSERT') { name = e.props.blockName; source = "Block"; detail="Block Insert"; rawUsage.blockNames++; }
+                        else if (e.type === 'ATTRIB') { name = e.props.text; source = "Attribute"; detail="Block Tag"; rawUsage.attributes++; }
+                        let finalX = e.props.x; let finalY = e.props.y; let finalZ = e.props.z || 0;
+                        if (mergeSettings.swapXY) { const temp = finalX; finalX = finalY; finalY = temp; }
+                        if (mergeSettings.invertZ) { finalZ = -finalZ; }
+                        rawPoints.push({ id: idx, name: name || `Entity ${autoId++}`, x: finalX, y: finalY, z: finalZ, layer: e.props.layer, source: source, type: e.type, isGeneric: !name, nameDetail: detail, geomDetail: "Raw Coordinates", candidates: [] });
+                    });
+                    setExtractionStats({ used: rawUsage, total: { ...totals, points: rawPoints.length } });
+                    setExtractedPoints(rawPoints);
+                    return;
+                }
+
+                const spatialMap = new Map();
+                const prec = mergeSettings.precision;
+                const getKey = (x, y, z) => {
+                    if (mergeSettings.ignoreZ) return `${x?.toFixed(prec)}_${y?.toFixed(prec)}`;
+                    return `${x?.toFixed(prec)}_${y?.toFixed(prec)}_${z?.toFixed(prec)}`;
+                };
+
+                rawEntities.forEach(e => {
+                    if (e.props.x === undefined || e.props.y === undefined) return;
+                    const key = getKey(e.props.x, e.props.y, e.props.z);
+                    if (!spatialMap.has(key)) spatialMap.set(key, { point: null, text: null, insert: null, attribs: [], layer: e.props.layer, x: e.props.x, y: e.props.y, z: e.props.z || 0 });
+                    const group = spatialMap.get(key);
+                    if (mergeSettings.ignoreZ && e.props.z !== 0 && group.z === 0) group.z = e.props.z;
+                    if (e.type === 'POINT') { group.point = e; if (mergeSettings.ignoreZ && e.props.z !== 0) group.z = e.props.z; }
+                    else if (e.type === 'TEXT' || e.type === 'MTEXT') { if (!group.text || (e.props.text && e.props.text.length > group.text.props.text.length)) group.text = e; }
+                    else if (e.type === 'INSERT') { group.insert = e; if (mergeSettings.ignoreZ && e.props.z !== 0 && !group.point) group.z = e.props.z; }
+                    else if (e.type === 'ATTRIB') group.attribs.push(e);
+                });
+
+                const usedStats = { attributes: 0, textLabels: 0, blockNames: 0, layers: 0, autoIds: 0 };
+                const validPoints = [];
+
+                spatialMap.forEach((group, key) => {
+                    let isValidGeom = false; let geomDetail = "Unknown"; let finalLayer = group.layer;
+                    let finalX = group.x; let finalY = group.y; let finalZ = group.z;
+                    if (mergeSettings.geomPriority === 'point' && group.point) { finalX = group.point.props.x; finalY = group.point.props.y; if(!mergeSettings.ignoreZ) finalZ = group.point.props.z || 0; }
+                    else if (mergeSettings.geomPriority === 'text' && group.text) { finalX = group.text.props.x; finalY = group.text.props.y; if(!mergeSettings.ignoreZ) finalZ = group.text.props.z || 0; }
+                    else if (mergeSettings.geomPriority === 'insert' && group.insert) { finalX = group.insert.props.x; finalY = group.insert.props.y; if(!mergeSettings.ignoreZ) finalZ = group.insert.props.z || 0; }
+                    if (mergeSettings.usePointCoords && group.point) { isValidGeom = true; geomDetail = "POINT Entity"; finalLayer = group.point.props.layer; }
+                    else if (mergeSettings.useInsertCoords && group.insert) { isValidGeom = true; geomDetail = "Block Insertion"; if (!group.point) finalLayer = group.insert.props.layer; }
+                    else if (mergeSettings.useTextCoords && group.text) { isValidGeom = true; geomDetail = "Text Anchor"; }
+                    if (!isValidGeom) return;
+                    let name = "Unnamed"; let nameDetail = "N/A"; let isGenericName = true; let source = "Unknown";
+                    const candidates = [];
+                    const extractName = (type) => {
+                        if (type === 'attribute' && group.attribs.length > 0) {
+                            const nameAttr = group.attribs.find(a => ['NAME', 'LABEL', 'ID'].includes(a.props.text?.toUpperCase())) || group.attribs[0];
+                            if (nameAttr && nameAttr.props.text) return { val: nameAttr.props.text, src: "Attribute", det: "Tag Value" };
+                        }
+                        if (type === 'text' && group.text && group.text.props.text) return { val: group.text.props.text, src: "Text Label", det: "Nearby Text" };
+                        if (type === 'block' && group.insert && group.insert.props.blockName) return { val: group.insert.props.blockName, src: "Block Type", det: "Block Name" };
+                        if (type === 'layer') {
+                            const cleanLayer = finalLayer.toLowerCase().trim();
+                            if (!['0', 'points', 'default', 'markers', 'shape', 'v-node'].includes(cleanLayer)) return { val: finalLayer, src: "Layer", det: "Layer Name" };
+                        }
+                        return null;
+                    };
+                    ['attribute', 'text', 'block', 'layer'].forEach(type => { const res = extractName(type); if(res) candidates.push(res); });
+                    for (const type of namingPriority) {
+                        const isEnabled = (type === 'attribute' && mergeSettings.useAttributes) || (type === 'text' && mergeSettings.useText) || (type === 'block' && mergeSettings.useBlockNames) || (type === 'layer' && mergeSettings.useLayers);
+                        if (isEnabled) {
+                            const result = extractName(type);
+                            if (result) { name = result.val; source = result.src; nameDetail = result.det; isGenericName = false; 
+                                if (type === 'attribute') usedStats.attributes++; if (type === 'text') usedStats.textLabels++; if (type === 'block') usedStats.blockNames++; if (type === 'layer') usedStats.layers++;
+                                break; 
+                            }
+                        }
+                    }
+                    if (isGenericName) { name = `Point`; source = "Auto-ID"; nameDetail = "Sequence"; usedStats.autoIds++; }
+                    if (mergeSettings.swapXY) { const temp = finalX; finalX = finalY; finalY = temp; }
+                    if (mergeSettings.invertZ) { finalZ = -finalZ; }
+                    validPoints.push({ name, x: finalX, y: finalY, z: finalZ, layer: finalLayer, isGeneric: isGenericName, source, nameDetail, geomDetail, type: group.point ? 'Point' : (group.insert ? 'Block' : 'Text Anchor'), candidates });
+                });
+                validPoints.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'}));
+                const finalPoints = validPoints.map((p, idx) => ({ ...p, id: idx, name: p.isGeneric ? `${p.name} ${idx + 1}` : p.name }));
+                setExtractionStats({ used: usedStats, total: { ...totals, points: validPoints.length } });
+                setExtractedPoints(finalPoints);
+            }, [rawEntities, mergeSettings, namingPriority]); 
+
+            // --- Handlers ---
+            const handleFinalizePCS = () => {
+                if (!prjData || !prjData.wkt) { setError("A Coordinate System (PRJ) is required to proceed."); return; }
+                if (!window.proj4) { setError("Conversion library not loaded."); return; }
+                try {
+                    const sourceCRS = prjData.wkt;
+                    const destCRS = "+proj=longlat +datum=WGS84 +no_defs";
+                    const converted = extractedPoints.map(p => {
+                        const [lon, lat] = window.proj4(sourceCRS, destCRS, [p.x, p.y]);
+                        return { ...p, lat, lon, z: p.z };
+                    });
+                    setConvertedPoints(converted);
+                    setAppStep('gcs'); 
+                } catch (err) { console.error(err); setError("Projection conversion failed."); }
+            };
+            
+            const handleProceedToMap = () => {
+                setAppStep('map');
+                // View mode effect handles defaulting to 'all' if empty
+            }
+
+            const processKmlFiles = async (files, currentGroups = {}, currentPolys = {}) => {
+                const processKmlText = (text, filename) => {
+                    const parser = new DOMParser();
+                    const xmlDoc = parser.parseFromString(text, "text/xml");
+                    const fileGroups = {};
+                    const filePolys = {};
+                    const folders = xmlDoc.getElementsByTagName("Folder");
+                    for (let i = 0; i < folders.length; i++) {
+                        const folder = folders[i];
+                        const rawFolderName = folder.getElementsByTagName("name")[0]?.textContent || `Group_${i+1}`;
+                        let folderName = "";
+                        const cleanFileName = filename.replace('.kml', '');
+                        if (cleanFileName.includes(rawFolderName) || rawFolderName.includes(cleanFileName)) {
+                            folderName = rawFolderName.length > cleanFileName.length ? rawFolderName : cleanFileName;
+                        } else { folderName = `${cleanFileName} - ${rawFolderName}`; }
+                        const placemarks = folder.getElementsByTagName("Placemark");
+                        const folderPolyCoords = [];
+                        for (let j = 0; j < placemarks.length; j++) {
+                            const coords = placemarks[j].getElementsByTagName("coordinates")[0];
+                            if (coords && (placemarks[j].getElementsByTagName("Polygon").length > 0 || placemarks[j].getElementsByTagName("LinearRing").length > 0)) {
+                                const rawCoords = coords.textContent.trim().split(/\s+/);
+                                const polyCoords = rawCoords.map(c => { const parts = c.split(','); return [parseFloat(parts[0]), parseFloat(parts[1])]; });
+                                if (polyCoords.length > 0) {
+                                    const first = polyCoords[0]; const last = polyCoords[polyCoords.length-1];
+                                    if (first[0] !== last[0] || first[1] !== last[1]) polyCoords.push(first);
+                                    if (polyCoords.length >= 4) {
+                                        const poly = window.turf.polygon([polyCoords]);
+                                        folderPolyCoords.push(poly);
+                                        filePolys[folderName] = poly; 
+                                    }
+                                }
+                            }
+                        }
+                        if (folderPolyCoords.length > 0) {
+                            const ptsInFolder = convertedPoints.filter(p => {
+                                const pt = window.turf.point([p.lon, p.lat]);
+                                return folderPolyCoords.some(poly => window.turf.booleanPointInPolygon(pt, poly));
+                            });
+                            if (ptsInFolder.length > 0) { fileGroups[folderName] = ptsInFolder; }
+                        }
+                    }
+                    return { fileGroups, filePolys };
+                };
+
+                if(!window.turf) { setError("Turf.js library not loaded yet."); return; }
+                const newGroups = { ...currentGroups };
+                const newPolys = { ...currentPolys };
+                for (const file of files) {
+                    const text = await readFileAsText(file);
+                    const { fileGroups, filePolys } = processKmlText(text, file.name);
+                    Object.keys(fileGroups).forEach(gName => {
+                        newGroups[gName] = fileGroups[gName];
+                        newPolys[gName] = filePolys[gName]; 
+                        if (!permanentSelection[gName]) {
+                            const permSet = new Set(fileGroups[gName].slice(0, 3).map(p => p.id));
+                            setPermanentSelection(prev => ({...prev, [gName]: permSet}));
+                        }
+                    });
+                }
+                return { newGroups, newPolys };
+            };
+
+            const handleGroupingKml = async (files) => {
+                const fileList = Array.from(files);
+                const newFileList = [...groupingFiles, ...fileList];
+                setGroupingFiles(newFileList);
+                const { newGroups, newPolys } = await processKmlFiles(fileList, pointGroups, groupPolygons);
+                setPointGroups(newGroups);
+                setGroupPolygons(newPolys);
+                setViewMode('groups'); // Switch to group view if KMLs added
+            };
+
+            const handleRemoveKml = async (index) => {
+                if(!window.turf) return;
+                const updatedFiles = groupingFiles.filter((_, i) => i !== index);
+                setGroupingFiles(updatedFiles);
+                setPointGroups({});
+                setGroupPolygons({});
+                setPermanentSelection({});
+                setExcludedSelection({});
+                if (updatedFiles.length > 0) {
+                    const { newGroups, newPolys } = await processKmlFiles(updatedFiles, {}, {});
+                    setPointGroups(newGroups);
+                    setGroupPolygons(newPolys);
+                }
+            };
+
+            // Custom Grouping Logic
+            const handleCreateCustomGroup = () => {
+                if (!newGroupName.trim() || selectionForGroup.size === 0) return;
+                const selectedPoints = convertedPoints.filter(p => selectionForGroup.has(p.id));
+                const newGroups = { ...pointGroups, [newGroupName]: selectedPoints };
+                const permSet = new Set(selectedPoints.slice(0, 3).map(p => p.id));
+                setPermanentSelection(prev => ({...prev, [newGroupName]: permSet}));
+                setPointGroups(newGroups);
+                setNewGroupName('');
+                setSelectionForGroup(new Set()); 
+                setIsCustomGroupModalOpen(false);
+                setViewMode('groups'); // Switch to group view after creating
+            };
+
+            const togglePointForGroup = (id) => {
+                const newSet = new Set(selectionForGroup);
+                if (newSet.has(id)) newSet.delete(id); else newSet.add(id);
+                setSelectionForGroup(newSet);
+            };
+
+             const handleSelectAllForGroup = () => {
+                 const allIds = convertedPoints.map(p => p.id);
+                 setSelectionForGroup(new Set(allIds));
+             };
+
+            const togglePermanent = (groupName, pid) => {
+                const current = new Set(permanentSelection[groupName]);
+                if (current.has(pid)) current.delete(pid); else current.add(pid);
+                setPermanentSelection(prev => ({...prev, [groupName]: current}));
+            };
+
+            const toggleExcluded = (groupName, pid) => {
+                const current = new Set(excludedSelection[groupName]);
+                if (current.has(pid)) current.delete(pid); else current.add(pid);
+                setExcludedSelection(prev => ({...prev, [groupName]: current}));
+            };
+            
+            const toggleGroupExpand = (gName) => {
+                const newSet = new Set(expandedGroups);
+                if (newSet.has(gName)) newSet.delete(gName); else newSet.add(gName);
+                setExpandedGroups(newSet);
+            };
+            
+            const zoomToGroup = (gName) => {
+                if (!mapRef.current || !window.L || !window.L.map) return;
+                if (gName && groupPolygons[gName]) {
+                    const bbox = window.turf.bbox(groupPolygons[gName]);
+                    mapRef.current.fitBounds([[bbox[1], bbox[0]], [bbox[3], bbox[2]]], { padding: [50, 50] });
+                } else if (convertedPoints.length > 0) {
+                    const bounds = window.L.latLngBounds(convertedPoints.map(p => [p.lat, p.lon]));
+                    mapRef.current.fitBounds(bounds, {padding: [50, 50]});
+                }
+            };
+            
+            const autoSelectFirst3 = () => {
+                const newPerms = {};
+                Object.keys(pointGroups).forEach(g => { newPerms[g] = new Set(pointGroups[g].slice(0, 3).map(p => p.id)); });
+                setPermanentSelection(newPerms);
+            };
+
+            const switchStrategy = (newStrategy) => {
+                setStrategyCache(prev => ({ ...prev, [activeStrategy]: { points: extractedPoints, stats: extractionStats, settings: mergeSettings, manualCount: manualChangesCount } }));
+                if (strategyCache[newStrategy]) { const cached = strategyCache[newStrategy]; ignoreConsolidation.current = true; setMergeSettings(cached.settings); setExtractedPoints(cached.points); setExtractionStats(cached.stats); setManualChangesCount(cached.manualCount); setActiveStrategy(newStrategy); setRestoredMessage(`Restored ${newStrategy} session`); setTimeout(() => setRestoredMessage(null), 2000); } else { setManualChangesCount(0); if (newStrategy === 'smart') setMergeSettings(s => ({...s, precision: 3, ignoreZ: true, noMerge: false})); if (newStrategy === 'strict') setMergeSettings(s => ({...s, precision: 3, ignoreZ: false, noMerge: false})); if (newStrategy === 'raw') setMergeSettings(s => ({...s, noMerge: true})); setActiveStrategy(newStrategy); }
+            };
+            useEffect(() => { consolidateData(); }, [consolidateData]);
+            const handleSort = (key) => { setSortConfig(current => ({ key, direction: current.key === key && current.direction === 'asc' ? 'desc' : 'asc' })); };
+            const handleClearSort = () => { setSortConfig({ key: null, direction: null }); };
+            const sortedPoints = useMemo(() => {
+                const sourceList = appStep === 'pcs' ? extractedPoints : convertedPoints;
+                if (sourceList.length === 0) return [];
+                if (!sortConfig.key) return sourceList;
+                const sorted = [...sourceList];
+                sorted.sort((a, b) => {
+                    let aVal = a[sortConfig.key]; let bVal = b[sortConfig.key];
+                    if (typeof aVal === 'string') return sortConfig.direction === 'asc' ? aVal.localeCompare(bVal, undefined, {numeric: true, sensitivity: 'base'}) : bVal.localeCompare(aVal, undefined, {numeric: true, sensitivity: 'base'});
+                    return sortConfig.direction === 'asc' ? aVal - bVal : bVal - aVal;
+                });
+                return sorted;
+            }, [extractedPoints, convertedPoints, sortConfig, appStep]);
+
+            const handleSelect = (id) => { const newSet = new Set(selectedIds); if (newSet.has(id)) newSet.delete(id); else newSet.add(id); setSelectedIds(newSet); };
+            const handleSelectAll = (e) => { if (e.target.checked) setSelectedIds(new Set((appStep === 'pcs' ? extractedPoints : convertedPoints).map(p => p.id))); else setSelectedIds(new Set()); };
+            const handleDeselectAll = () => setSelectedIds(new Set());
+            const handleDelete = (id) => { const newList = extractedPoints.filter(p => p.id !== id); setExtractedPoints(newList); setManualChangesCount(prev => prev + 1); };
+            const movePriority = (index, direction) => { const newOrder = [...namingPriority]; if (direction === 'up' && index > 0) { [newOrder[index], newOrder[index - 1]] = [newOrder[index - 1], newOrder[index]]; } else if (direction === 'down' && index < newOrder.length - 1) { [newOrder[index], newOrder[index + 1]] = [newOrder[index + 1], newOrder[index]]; } setNamingPriority(newOrder); };
+            const handleManualMergeTrigger = () => { const selected = extractedPoints.filter(p => selectedIds.has(p.id)); if (selected.length < 2) return; setMergeCandidates(selected); const bestName = selected.reduce((prev, curr) => (curr.name.length > prev.name.length ? curr : prev), selected[0]); const bestGeom = selected.find(p => p.type === 'Point') || selected.find(p => p.type === 'Block') || selected[0]; setMergeSelection({ name: bestName.id, x: bestGeom.id, y: bestGeom.id, z: bestGeom.id, layer: bestGeom.id }); setIsMergeModalOpen(true); };
+            const applyManualMerge = () => { if (!mergeSelection.name) return; const nameSource = mergeCandidates.find(p => p.id === mergeSelection.name); const xSource = mergeCandidates.find(p => p.id === mergeSelection.x); const ySource = mergeCandidates.find(p => p.id === mergeSelection.y); const zSource = mergeCandidates.find(p => p.id === mergeSelection.z); const layerSource = mergeCandidates.find(p => p.id === mergeSelection.layer); const newPoint = { id: Math.max(...extractedPoints.map(p => p.id)) + 1, name: nameSource.name, x: xSource.x, y: ySource.y, z: zSource.z, layer: layerSource.layer, source: "Manual Merge", type: xSource.type, isGeneric: false, nameDetail: "User Selected", geomDetail: "User Selected", candidates: [] }; const remaining = extractedPoints.filter(p => !selectedIds.has(p.id)); const newList = [...remaining, newPoint]; newList.sort((a, b) => a.name.localeCompare(b.name, undefined, {numeric: true, sensitivity: 'base'})); setExtractedPoints(newList); setSelectedIds(new Set()); setManualChangesCount(prev => prev + 1); setIsMergeModalOpen(false); };
+            const startEditing = (point) => { setEditingId(point.id); setEditForm({...point}); };
+            const cancelEditing = () => { setEditingId(null); setEditForm({}); };
+            const saveEditing = () => { const newList = extractedPoints.map(p => p.id === editingId ? { ...p, ...editForm, x: parseFloat(editForm.x), y: parseFloat(editForm.y), z: parseFloat(editForm.z), source: "Manual Edit" } : p); setExtractedPoints(newList); setManualChangesCount(prev => prev + 1); setEditingId(null); setEditForm({}); };
+            const handlePrjSet = () => { const parsed = parsePRJFull(manualPrjText); if (parsed.name || parsed.projection) { setPrjData({...parsed, filename: "Manual Input"}); setPrjInputMode('file'); } else { setError("Invalid WKT string"); } };
+            const handleClearPrj = (e) => { e.stopPropagation(); setPrjData(null); setPrjInputMode('file'); };
+            const processFiles = async (fileObj, prjFileObj) => { setIsProcessing(true); setError(null); try { if (prjFileObj) { const prjText = await readFileAsText(prjFileObj); setPrjData({ ...parsePRJFull(prjText), filename: prjFileObj.name }); } if (fileObj) { setDxfFile({ name: fileObj.name }); const dxfText = await readFileAsText(fileObj); const { entities, layers, header } = parseDXFAdvanced(dxfText); setLayerStats(Object.keys(layers).map(k => ({ name: k, ...layers[k] }))); setDxfHeader(header); setRawEntities(entities); setShowConfigPanel(true); } } catch (err) { setError("Failed to parse files."); } finally { setIsProcessing(false); } };
+            const handleFileChange = (e, type) => { const file = e.target.files[0]; if (!file) return; type === 'dxf' ? processFiles(file, document.getElementById('prj-input').files[0]) : processFiles(document.getElementById('dxf-input').files[0], file); };
+            const reset = () => { setDxfFile(null); setPrjData(null); setRawEntities([]); setExtractedPoints([]); setLayerStats([]); setDxfHeader({}); setError(null); setSelectedIds(new Set()); if(document.getElementById('dxf-input')) document.getElementById('dxf-input').value = ""; if(document.getElementById('prj-input')) document.getElementById('prj-input').value = ""; setPrjInputMode('file'); setManualPrjText(''); setStrategyCache({}); setManualChangesCount(0); setAppStep('pcs'); setConvertedPoints([]); setGroupingFiles([]); setPointGroups({}); setGroupPolygons({}); setExcludedSelection({}); setSelectionForGroup(new Set()); };
+
+            const handleExportXLSX = (dataset) => {
+                if (!window.XLSX) return;
+                const data = dataset.map(p => {
+                    if (appStep === 'pcs') {
+                        return {
+                            Name: p.name,
+                            [mergeSettings.swapXY ? 'Northing (Y)' : 'Easting (X)']: p.x, 
+                            [mergeSettings.swapXY ? 'Easting (X)' : 'Northing (Y)']: p.y,
+                            'Elevation (Z)': p.z,
+                            Layer: p.layer, Type: p.type, Source: p.source, Details: p.nameDetail
+                        };
+                    } else {
+                        return {
+                            Name: p.name,
+                            'Latitude (DMS)': toDMS(p.lat, true),
+                            'Longitude (DMS)': toDMS(p.lon, false),
+                            'Altitude': p.z, 
+                            'Original X': p.x, 'Original Y': p.y
+                        };
+                    }
+                });
+                const worksheet = window.XLSX.utils.json_to_sheet(data);
+                const range = window.XLSX.utils.decode_range(worksheet['!ref']);
+                const fmt = "0." + "0".repeat(exportPrecision);
+                for (let R = range.s.r + 1; R <= range.e.r; ++R) {
+                    for(let C = range.s.c; C <= range.e.c; ++C) {
+                        const cellRef = window.XLSX.utils.encode_cell({c: C, r: R});
+                        if (worksheet[cellRef] && worksheet[cellRef].t === 'n') {
+                            worksheet[cellRef].z = fmt; 
+                        }
+                    }
+                }
+                const workbook = window.XLSX.utils.book_new();
+                window.XLSX.utils.book_append_sheet(workbook, worksheet, appStep === 'pcs' ? "Projected" : "Geographic");
+                window.XLSX.writeFile(workbook, `markers_${appStep}.xlsx`);
+            };
+
+            // --- Legal Export Handler with Styling & Shapefiles ---
+            const handleLegalExport = async () => {
+                if (!window.JSZip || !window.XLSX) return;
+                const zip = new window.JSZip();
+                
+                for (const [groupName, points] of Object.entries(pointGroups)) {
+                    const activePoints = points.filter(p => !excludedSelection[groupName]?.has(p.id));
+                    if (activePoints.length === 0) continue;
+
+                    const root = zip.folder(groupName).folder("3");
+                    const excelGCP = root.folder("MS-EXCEL GCP DATA");
+                    const excelPerm = root.folder("MS-EXCEL PERMANENT GCP DATA");
+                    const shapeRoot = root.folder("SHAPE FILE GCP DATA");
+                    const shapeGCS = shapeRoot.folder("GCS SHAPE FILE GCP DATA");
+                    const shapePCS = shapeRoot.folder("PCS SHAPE FILE GCP DATA");
+                    
+                    const createExcelData = (pts) => {
+                        const data = [
+                            [groupName],
+                            ["MS-EXCEL GCP DATA GCS & UTM (Datum : WGS 84)"],
+                            ["LABEL", "EASTING (X)", "NORTHING (Y)", "ELEVATION (Z)", "LATITUDE", "LONGITUDE"]
+                        ];
+                        pts.forEach(p => {
+                            data.push([
+                                p.name,
+                                parseFloat(p.x.toFixed(exportPrecision)),
+                                parseFloat(p.y.toFixed(exportPrecision)),
+                                parseFloat(p.z.toFixed(exportPrecision)),
+                                toDMS(p.lat, true),
+                                toDMS(p.lon, false)
+                            ]);
+                        });
+                        return data;
+                    };
+
+                    const allPointsData = createExcelData(activePoints);
+                    const permPoints = activePoints.filter(p => permanentSelection[groupName]?.has(p.id));
+                    const permPointsData = createExcelData(permPoints.length > 0 ? permPoints : activePoints.slice(0,3));
+
+                    const writeStyledSheet = (data, filename, folder) => {
+                        const ws = window.XLSX.utils.aoa_to_sheet(data);
+                        ws['!merges'] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 5 } }, { s: { r: 1, c: 0 }, e: { r: 1, c: 5 } }];
+                        ws['!cols'] = [{wch:20}, {wch:15}, {wch:15}, {wch:15}, {wch:20}, {wch:20}];
+                        ws['!views'] = [{ showGridLines: false }];
+                        
+                        const range = window.XLSX.utils.decode_range(ws['!ref']);
+                        const headerStyle1 = { font: { name: "Calibri", sz: 16, bold: true, color: { rgb: "FF0000" } }, fill: { fgColor: { rgb: "FFFF00" } }, alignment: { horizontal: "center", vertical: "center" }, border: { top: { style: "thin", color: { rgb: "000000" } }, bottom: { style: "thin", color: { rgb: "000000" } }, left: { style: "thin", color: { rgb: "000000" } }, right: { style: "thin", color: { rgb: "000000" } } } };
+                        const colHeaderStyle = { font: { name: "Calibri", sz: 14, bold: true, color: { rgb: "000000" } }, fill: { fgColor: { rgb: "FFA500" } }, alignment: { horizontal: "center", vertical: "center" }, border: { top: { style: "thin", color: { rgb: "000000" } }, bottom: { style: "thin", color: { rgb: "000000" } }, left: { style: "thin", color: { rgb: "000000" } }, right: { style: "thin", color: { rgb: "000000" } } } };
+                        const dataStyleBase = { font: { name: "Calibri", sz: 14, bold: true, color: { rgb: "000000" } }, alignment: { horizontal: "center", vertical: "center" }, border: { top: { style: "thin", color: { rgb: "000000" } }, bottom: { style: "thin", color: { rgb: "000000" } }, left: { style: "thin", color: { rgb: "000000" } }, right: { style: "thin", color: { rgb: "000000" } } } };
+
+                        for (let R = range.s.r; R <= range.e.r; ++R) {
+                            for (let C = range.s.c; C <= range.e.c; ++C) {
+                                const cellRef = window.XLSX.utils.encode_cell({ c: C, r: R });
+                                if (!ws[cellRef]) ws[cellRef] = { v: "", t: "s" }; 
+                                if (R === 0 || R === 1) ws[cellRef].s = headerStyle1;
+                                else if (R === 2) ws[cellRef].s = colHeaderStyle;
+                                else {
+                                    const isGray = (R - 3) % 2 === 0; 
+                                    ws[cellRef].s = { ...dataStyleBase, fill: { fgColor: { rgb: isGray ? "D3D3D3" : "FFFFFF" } } };
+                                }
+                            }
+                        }
+                        const wb = window.XLSX.utils.book_new();
+                        window.XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
+                        const wbout = window.XLSX.write(wb, {bookType:'xlsx', type:'array'});
+                        folder.file(`${filename}.xlsx`, wbout);
+                    };
+
+                    writeStyledSheet(allPointsData, "MS-EXCEL GCP DATA", excelGCP);
+                    writeStyledSheet(permPointsData, "MS-EXCEL PERMANENT GCP DATA", excelPerm);
+                    
+                    // --- Shapefile Generation (Using shp-write) ---
+                    const gcsGeoJSON = activePoints.map(p => ({
+                         x: p.lon, y: p.lat, // Geometry
+                         label: p.name,
+                         val1: toDMS(p.lat, true), // Latitude DMS
+                         val2: toDMS(p.lon, false), // Longitude DMS
+                         z: p.z.toFixed(exportPrecision),
+                         group: groupName,
+                         note: "Elevation (Z) is in EGM96 and Metric Units (Meters)"
+                    }));
+
+                    const pcsPoints = activePoints.map(p => ({
+                         x: p.x, y: p.y, // Geometry
+                         label: p.name,
+                         val1: p.x.toFixed(exportPrecision), // Easting
+                         val2: p.y.toFixed(exportPrecision), // Northing
+                         z: p.z.toFixed(exportPrecision),
+                         group: groupName,
+                         note: "Elevation (Z) is in EGM96 and Metric Units (Meters)"
+                    }));
+
+                    // Function to generate binary shapefiles and put them in zip folder
+                    const generateShapefiles = (points, folderRef, filePrefix, wktStr, type) => {
+                        const { shp, shx, dbf } = writePointShapefile(points, type);
+                        folderRef.file(`${filePrefix}.shp`, shp);
+                        folderRef.file(`${filePrefix}.shx`, shx);
+                        folderRef.file(`${filePrefix}.dbf`, dbf);
+                        folderRef.file(`${filePrefix}.cpg`, "UTF-8"); // Add CPG file
+                        if (wktStr) folderRef.file(`${filePrefix}.prj`, wktStr);
+                    };
+
+                    generateShapefiles(gcsGeoJSON, shapeGCS, "GCS SHAPE FILE GCP DATA", WGS84_WKT, 'GCS');
+                    generateShapefiles(pcsPoints, shapePCS, "PCS SHAPE FILE GCP DATA", prjData ? prjData.wkt : null, 'PCS');
+                }
+                
+                const content = await zip.generateAsync({type:"blob"});
+                const url = window.URL.createObjectURL(content);
+                const a = document.createElement('a'); a.href = url; a.download = "Legal_GCP_Export.zip"; a.click();
+            };
+
+            const renderSortArrow = (key) => { if (sortConfig.key !== key) return <div className="w-4" />; return sortConfig.direction === 'asc' ? <ArrowUp size={14} className="text-blue-600"/> : <ArrowDown size={14} className="text-blue-600"/>; };
+            const SortableHeader = ({ label, sortKey, alignRight }) => ( <th className={`px-6 py-4 cursor-pointer hover:bg-slate-100 transition-colors select-none ${alignRight ? 'text-right' : 'text-left'} ${alignRight && 'bg-slate-100/50'}`} onClick={() => handleSort(sortKey)}><div className={`flex items-center gap-2 ${alignRight ? 'justify-end' : 'justify-start'}`}>{!alignRight && renderSortArrow(sortKey)}{label}{alignRight && renderSortArrow(sortKey)}</div></th> );
+
+            // --- Map Init (Stage 3) ---
+            useEffect(() => {
+                if (appStep === 'map' && isLibsReady && document.getElementById('map-container')) {
+                    if (mapRef.current) { mapRef.current.remove(); mapRef.current = null; }
+                    if(!window.L || !window.L.map) return;
+
+                    const map = window.L.map('map-container').setView([0, 0], 2);
+                    mapRef.current = map;
+
+                    window.L.tileLayer('https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png', {
+                        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>',
+                        maxZoom: 25,
+                        maxNativeZoom: 19 
+                    }).addTo(map);
+                    
+                    const bounds = window.L.latLngBounds();
+
+                    // 1. Draw Polygons
+                    Object.entries(groupPolygons).forEach(([name, poly]) => {
+                        const color = stringToColor(name);
+                        const geoJson = window.L.geoJSON(poly, {
+                            style: { color: color, weight: 2, fillOpacity: 0.2 },
+                            onEachFeature: (f, l) => { 
+                                l.bindPopup(`
+                                    <div style="font-family:sans-serif; font-size:12px;">
+                                        <strong>Group:</strong> ${name}
+                                    </div>
+                                `); 
+                            }
+                        }).addTo(map);
+                        bounds.extend(geoJson.getBounds());
+                    });
+
+                    // 2. Map Points to Groups
+                    const pointToGroup = {};
+                    Object.entries(pointGroups).forEach(([gName, pts]) => {
+                        pts.forEach(p => { pointToGroup[p.id] = gName; });
+                    });
+
+                    // 3. Draw Points
+                    convertedPoints.forEach(p => {
+                        const groupName = pointToGroup[p.id];
+                        const isExcluded = groupName && excludedSelection[groupName]?.has(p.id);
+                        const color = isExcluded ? '#94a3b8' : (groupName ? stringToColor(groupName) : '#FFD700'); 
+                        const opacity = isExcluded ? 0.5 : 1;
+
+                        const svgIcon = window.L.divIcon({
+                            className: 'custom-div-icon',
+                            html: `<svg width="24" height="24" viewBox="0 0 24 24" fill="${color}" stroke="black" stroke-width="1.5" stroke-opacity="${opacity}" fill-opacity="${opacity}" xmlns="http://www.w3.org/2000/svg">
+                                    <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z"/>
+                                    <circle cx="12" cy="9" r="2.5" fill="black" fill-opacity="${opacity}"/>
+                                </svg>`,
+                            iconSize: [24, 24], iconAnchor: [12, 24], popupAnchor: [0, -24]
+                        });
+
+                        const marker = window.L.marker([p.lat, p.lon], {icon: svgIcon}).addTo(map);
+                        const content = `
+                            <div style="font-family:sans-serif; font-size:12px; min-width:180px;">
+                                <div style="background-color:${color}20; padding:4px; border-radius:4px; border:1px solid ${color}40; margin-bottom:6px;">
+                                    <strong style="color:#0f172a;">${p.name}</strong>
+                                    ${groupName ? `<br/><span style="color:${color}; font-weight:bold; font-size:10px;">${groupName}</span>` : ''}
+                                    ${isExcluded ? `<br/><span style="color:#ef4444; font-weight:bold; font-size:10px;">(Excluded)</span>` : ''}
+                                </div>
+                                <div style="background-color:#eff6ff; padding:4px; border-radius:4px; margin-bottom:4px;">
+                                    <strong style="color:#1d4ed8; font-size:10px; display:block; margin-bottom:2px;">📍 Plotted via Geodetic (Lat/Lon)</strong>
+                                    <div style="display:grid; grid-template-columns: 25px 1fr; gap:2px; color:#334155;">
+                                        <span>Lat:</span> <span style="font-family:monospace;">${toDMS(p.lat, true)}</span>
+                                        <span>Lon:</span> <span style="font-family:monospace;">${toDMS(p.lon, false)}</span>
+                                        <span>Alt:</span> <span style="font-family:monospace;">${p.z.toFixed(3)}m</span>
+                                    </div>
+                                </div>
+                                <div style="background-color:#f8fafc; padding:4px; border-radius:4px; border:1px solid #e2e8f0;">
+                                    <strong style="color:#64748b; font-size:10px; display:block; margin-bottom:2px;">Original Projected (PCS)</strong>
+                                    <div style="display:grid; grid-template-columns: 25px 1fr; gap:2px; color:#64748b;">
+                                        <span>E:</span> <span style="font-family:monospace;">${p.x.toFixed(3)}</span>
+                                        <span>N:</span> <span style="font-family:monospace;">${p.y.toFixed(3)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                        marker.bindPopup(content);
+                        bounds.extend([p.lat, p.lon]);
+                    });
+                    
+                    if (convertedPoints.length > 0 || Object.keys(groupPolygons).length > 0) map.fitBounds(bounds, {padding: [50, 50]});
+                    return () => { if(mapRef.current) { mapRef.current.remove(); mapRef.current = null; } };
+                }
+            }, [appStep, convertedPoints, groupPolygons, isLibsReady, excludedSelection]);
+
+            return (
+                <div className="min-h-screen bg-slate-50 font-sans text-slate-800 pb-20 relative">
+                <div className="bg-white border-b border-slate-200 sticky top-0 z-20 shadow-sm">
+                    <div className="max-w-7xl mx-auto px-6 py-4 flex flex-col md:flex-row justify-between items-center gap-4">
+                        <div className="flex items-center gap-2 w-full md:w-auto">
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-all ${appStep === 'pcs' ? 'bg-blue-50 border border-blue-200 text-blue-700 font-bold' : 'text-slate-400'}`}>
+                                <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${appStep === 'pcs' ? 'bg-blue-600 text-white' : 'bg-slate-200'}`}>1</div>
+                                <span>Extract</span>
+                            </div>
+                            <div className="w-8 h-px bg-slate-200"></div>
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-all ${appStep === 'gcs' ? 'bg-indigo-50 border border-indigo-200 text-indigo-700 font-bold' : 'text-slate-400'}`}>
+                                <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${appStep === 'gcs' ? 'bg-indigo-600 text-white' : 'bg-slate-200'}`}>2</div>
+                                <span>Convert</span>
+                            </div>
+                            <div className="w-8 h-px bg-slate-200"></div>
+                            <div className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-all ${appStep === 'map' ? 'bg-green-50 border border-green-200 text-green-700 font-bold' : 'text-slate-400'}`}>
+                                <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs ${appStep === 'map' ? 'bg-green-600 text-white' : 'bg-slate-200'}`}>3</div>
+                                <span>Group & Export</span>
+                            </div>
+                        </div>
+                        <div className="flex items-center gap-3">
+                            {appStep === 'map' && (<button onClick={() => setAppStep('pcs')} className="flex items-center gap-2 text-sm text-slate-500 hover:text-blue-600 px-3 py-1.5 rounded-lg border border-slate-200 hover:bg-slate-50"><RotateCcw size={14}/> Restart</button>)}
+                            {dxfFile && (<button onClick={reset} className="text-slate-500 hover:text-red-600 transition-colors p-2 rounded-full hover:bg-slate-100" title="Clear all"><Trash2 size={20} /></button>)}
+                        </div>
+                    </div>
+                </div>
+
+                <div className="max-w-7xl mx-auto px-6 py-8 space-y-8">
+                    
+                    {/* --- STAGE 1: PCS VIEW --- */}
+                    {appStep === 'pcs' && (
+                        <>
+                            <div className="grid md:grid-cols-2 gap-6">
+                                <div className={`relative h-48 rounded-xl border-2 border-dashed transition-all flex flex-col items-center justify-center text-center cursor-pointer group ${dxfFile ? 'border-teal-500 bg-teal-50/50' : 'border-slate-300 bg-white hover:border-blue-400 hover:shadow-md'}`}>
+                                    <input type="file" id="dxf-input" accept=".dxf" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" onChange={(e) => handleFileChange(e, 'dxf')} />
+                                    {dxfFile ? ( <div className="flex flex-col items-center gap-3 w-full px-6"><CheckCircle className="w-10 h-10 text-teal-600 mb-1" /><div className="text-center"><span className="block font-bold text-teal-900 text-lg mb-1">{dxfFile.name}</span><span className="block text-teal-700 text-sm font-medium">{extractedPoints.length} points</span></div></div> ) : ( <><Database className="w-10 h-10 text-slate-300 group-hover:text-blue-500 mb-2 transition-colors" /><span className="font-medium text-slate-600 group-hover:text-blue-600">Click to upload DXF</span></> )}
+                                </div>
+                                <div className={`relative h-48 rounded-xl border-2 border-dashed transition-all flex flex-col items-center justify-center text-center cursor-pointer group ${prjData ? 'border-indigo-500 bg-indigo-50/50' : 'border-slate-300 bg-white hover:border-indigo-400 hover:shadow-md'}`}>
+                                    {prjData ? ( <div className="relative w-full h-full flex flex-col items-center justify-center"><Globe className="w-10 h-10 text-indigo-600 mb-2" /><span className="font-bold text-indigo-900 text-lg">{prjData.filename}</span><span className="text-indigo-600 text-xs mt-1 max-w-xs truncate px-4">{prjData.name || "Custom Projection"}</span><button onClick={handleClearPrj} className="absolute top-2 right-2 p-1 text-indigo-400 hover:text-indigo-700 bg-white/50 rounded-full hover:bg-white transition-all"><X size={16}/></button></div> ) : prjInputMode === 'file' ? ( <><input type="file" id="prj-input" accept=".prj" className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10" onChange={(e) => handleFileChange(e, 'prj')} /><FileText className="w-10 h-10 text-slate-300 group-hover:text-indigo-500 mb-2 transition-colors" /><span className="font-medium text-slate-600 group-hover:text-indigo-600">Click to upload PRJ</span><span className="text-xs text-slate-400 mt-1">Required for Conversion</span><button onClick={(e) => {e.stopPropagation(); setPrjInputMode('manual');}} className="absolute bottom-4 text-xs text-indigo-500 hover:text-indigo-700 underline z-20 font-medium">Or enter WKT manually</button></> ) : ( <div className="w-full h-full p-4 flex flex-col cursor-default" onClick={(e) => e.stopPropagation()}><div className="flex items-center gap-2 text-indigo-700 mb-2 font-medium text-sm"><FileCode size={16}/> Manual WKT Input</div><textarea className="flex-1 w-full text-xs font-mono border rounded p-2 resize-none focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-slate-50" placeholder='PROJCS["WGS 84 / ...' value={manualPrjText} onChange={(e) => setManualPrjText(e.target.value)} /><div className="flex gap-2 mt-2 justify-end"><button onClick={() => setPrjInputMode('file')} className="px-3 py-1 text-xs text-slate-500 hover:bg-slate-100 rounded">Cancel</button><button onClick={handlePrjSet} className="px-3 py-1 text-xs bg-indigo-600 text-white rounded hover:bg-indigo-700 font-medium">Set Projection</button></div></div> )}
+                                </div>
+                            </div>
+
+                            {dxfFile && extractedPoints.length > 0 && (
+                                <>
+                                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 p-5">
+                                        <div className="flex items-center gap-2 mb-4"><Activity size={18} className="text-blue-600"/><h3 className="text-sm font-bold text-slate-800 uppercase tracking-wide">Data Quality Report</h3></div>
+                                        <div className="flex h-3 w-full rounded-full overflow-hidden mb-4 shadow-sm bg-slate-100">
+                                            <div className="bg-purple-400" style={{width: `${(extractionStats.used.attributes / Math.max(extractedPoints.length, 1)) * 100}%`}}/>
+                                            <div className="bg-green-400" style={{width: `${(extractionStats.used.textLabels / Math.max(extractedPoints.length, 1)) * 100}%`}}/>
+                                            <div className="bg-orange-400" style={{width: `${(extractionStats.used.blockNames / Math.max(extractedPoints.length, 1)) * 100}%`}}/>
+                                            <div className="bg-slate-400" style={{width: `${(extractionStats.used.layers / Math.max(extractedPoints.length, 1)) * 100}%`}}/>
+                                        </div>
+                                        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                                            <div className="flex flex-col bg-slate-50 p-3 rounded-lg border border-slate-100"><div className="flex items-center gap-2 mb-1"><span className="w-2.5 h-2.5 rounded-full bg-purple-400"></span><span className="text-xs font-bold text-slate-700">Attributes</span></div><div className="flex items-baseline gap-1"><span className="text-lg font-bold text-purple-700">{extractionStats.used.attributes}</span><span className="text-xs text-slate-400 font-medium">/ {extractionStats.total.attributes}</span></div></div>
+                                            <div className="flex flex-col bg-slate-50 p-3 rounded-lg border border-slate-100"><div className="flex items-center gap-2 mb-1"><span className="w-2.5 h-2.5 rounded-full bg-green-400"></span><span className="text-xs font-bold text-slate-700">Text Labels</span></div><div className="flex items-baseline gap-1"><span className="text-lg font-bold text-green-700">{extractionStats.used.textLabels}</span><span className="text-xs text-slate-400 font-medium">/ {extractionStats.total.textLabels}</span></div></div>
+                                            <div className="flex flex-col bg-slate-50 p-3 rounded-lg border border-slate-100"><div className="flex items-center gap-2 mb-1"><span className="w-2.5 h-2.5 rounded-full bg-orange-400"></span><span className="text-xs font-bold text-slate-700">Block Names</span></div><div className="flex items-baseline gap-1"><span className="text-lg font-bold text-orange-700">{extractionStats.used.blockNames}</span><span className="text-xs text-slate-400 font-medium">/ {extractionStats.total.blockNames}</span></div></div>
+                                            <div className="flex flex-col bg-slate-50 p-3 rounded-lg border border-slate-100"><div className="flex items-center gap-2 mb-1"><span className="w-2.5 h-2.5 rounded-full bg-slate-400"></span><span className="text-xs font-bold text-slate-700">Layers / Auto</span></div><div className="flex items-baseline gap-1"><span className="text-lg font-bold text-slate-700">{extractionStats.used.layers + extractionStats.used.autoIds}</span><span className="text-xs text-slate-400 font-medium">/ {extractionStats.total.points}</span></div></div>
+                                        </div>
+                                    </div>
+
+                                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden animate-in slide-in-from-top-4">
+                                        <div className="bg-slate-50 px-6 py-3 border-b border-slate-200 flex justify-between items-center cursor-pointer hover:bg-slate-100" onClick={() => setShowConfigPanel(!showConfigPanel)}>
+                                            <h3 className="text-sm font-bold text-slate-700 uppercase tracking-wide flex items-center gap-2"><Sliders size={16} /> Configuration</h3>
+                                            <button className="text-xs text-blue-600 hover:underline font-medium flex items-center gap-1">
+                                                {showConfigPanel ? <ChevronUp size={16}/> : <ChevronDown size={16}/>}
+                                                {showConfigPanel ? 'Hide' : 'Show'} Settings
+                                            </button>
+                                        </div>
+                                        
+                                        {showConfigPanel && (
+                                            <div className="p-6 grid lg:grid-cols-3 gap-8">
+                                                <div className="space-y-3">
+                                                    <div className="flex justify-between items-center"><label className="text-xs font-semibold text-slate-400 uppercase">1. Merge Strategy</label>{restoredMessage && <span className="text-xs text-green-600 font-medium animate-in fade-in slide-in-from-left-1 flex items-center gap-1"><History size={10}/> {restoredMessage}</span>}</div>
+                                                    <div className="flex rounded-lg bg-slate-100 p-1">{['smart', 'strict', 'raw', 'custom'].map(m => (<button key={m} onClick={() => setActiveStrategy(m) || setRestoredMessage(null)} onMouseDown={() => {switchStrategy(m)}} className={`relative flex-1 py-2 text-sm font-medium rounded-md capitalize transition-all ${activeStrategy === m ? 'bg-white text-blue-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>{m}{strategyCache[m]?.manualCount > 0 && <span className="absolute top-1 right-1 w-1.5 h-1.5 bg-orange-400 rounded-full" title="Contains Manual Edits"></span>}</button>))}</div>
+                                                    
+                                                    {activeStrategy === 'custom' && (<div className="mt-3 space-y-4 bg-white p-4 rounded-lg border border-slate-200 shadow-sm animate-in fade-in zoom-in-95"><div className="space-y-2"><div className="flex justify-between items-end"><span className="text-xs font-bold text-slate-700">Merge Distance</span><span className="text-xs bg-blue-50 text-blue-700 px-2 py-1 rounded font-mono border border-blue-100">{getToleranceLabel(mergeSettings.precision)}</span></div><input type="range" min="0" max="5" step="1" value={mergeSettings.precision} onChange={(e) => setMergeSettings(s => ({...s, precision: parseInt(e.target.value)}))} className="w-full h-2 bg-slate-100 rounded-lg appearance-none cursor-pointer accent-blue-600" /></div><div className="bg-slate-50 p-2.5 rounded border border-slate-100"><label className="flex items-start gap-2 cursor-pointer"><input type="checkbox" checked={mergeSettings.ignoreZ} onChange={e => setMergeSettings(s => ({...s, ignoreZ: e.target.checked}))} className="mt-1 rounded text-blue-600 focus:ring-blue-500"/><div><span className="block text-sm font-medium text-slate-800">Ignore Elevation (2D)</span><span className="block text-[10px] text-slate-500 leading-tight mt-0.5">Ignore Z height during merge.</span></div></label></div><div className="pt-2 border-t border-slate-100"><span className="text-xs font-bold text-slate-700 block mb-2">Conflict Priority</span><div className="grid grid-cols-3 gap-1">{[{ id: 'point', label: 'Point', sub: 'Geometry' }, { id: 'insert', label: 'Block', sub: 'Markers' }, { id: 'text', label: 'Text', sub: 'Label Pos' }].map(opt => ( <button key={opt.id} onClick={() => setMergeSettings(s => ({...s, geomPriority: opt.id}))} className={`flex flex-col items-center justify-center py-1.5 rounded border transition-all ${mergeSettings.geomPriority === opt.id ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-white border-slate-200 text-slate-500 hover:border-slate-300'}`}><span className="text-xs font-bold">{opt.label}</span><span className="text-[9px] opacity-70">{opt.sub}</span></button> ))}</div></div></div>)}
+                                                </div>
+                                                <div className="space-y-3">
+                                                    <label className="text-xs font-semibold text-slate-400 uppercase">2. Coordinate System</label>
+                                                    <div className="grid grid-cols-2 gap-3"><button onClick={() => setMergeSettings(s => ({...s, swapXY: !s.swapXY}))} className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium transition-all ${mergeSettings.swapXY ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'}`}><ArrowLeftRight size={16} /> {mergeSettings.swapXY ? 'Y, X' : 'X, Y'}</button><button onClick={() => setMergeSettings(s => ({...s, invertZ: !s.invertZ}))} className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg border text-sm font-medium transition-all ${mergeSettings.invertZ ? 'bg-orange-50 border-orange-200 text-orange-700' : 'bg-white border-slate-200 text-slate-600 hover:border-slate-300'}`}><ArrowUpDown size={16} /> {mergeSettings.invertZ ? '-Z' : '+Z'}</button></div>
+                                                </div>
+                                                <div className="space-y-3">
+                                                    <label className="text-xs font-semibold text-slate-400 uppercase">3. Geometry Filter</label>
+                                                    <div className="flex gap-2"><button onClick={() => setMergeSettings(s => ({...s, useTextCoords: !s.useTextCoords}))} className={`flex-1 flex flex-col items-center justify-center p-2 rounded-lg border transition-all ${mergeSettings.useTextCoords ? 'bg-teal-50 border-teal-200 text-teal-700' : 'bg-white border-slate-200 text-slate-400 grayscale'}`}><span className="text-xs font-bold">Text Anchors</span><span className="text-[10px] opacity-70">{mergeSettings.useTextCoords ? "Included" : "Ignored"}</span></button><button onClick={() => setMergeSettings(s => ({...s, useInsertCoords: !s.useInsertCoords}))} className={`flex-1 flex flex-col items-center justify-center p-2 rounded-lg border transition-all ${mergeSettings.useInsertCoords ? 'bg-teal-50 border-teal-200 text-teal-700' : 'bg-white border-slate-200 text-slate-400 grayscale'}`}><span className="text-xs font-bold">Blocks</span><span className="text-[10px] opacity-70">{mergeSettings.useInsertCoords ? "Included" : "Ignored"}</span></button></div>
+                                                </div>
+                                            </div>
+                                        )}
+                                        {showConfigPanel && ( 
+                                            <div className="px-6 py-5 bg-slate-50/80 border-t border-slate-200 animate-in slide-in-from-top-1">
+                                                <div className="flex items-center justify-between mb-4 cursor-pointer hover:opacity-80" onClick={() => setShowNamingLogic(!showNamingLogic)}><div><h4 className="text-sm font-bold text-slate-800 flex items-center gap-2"><FileDigit size={16} className="text-indigo-600"/>Naming Logic Priority</h4></div><button className="p-1 rounded hover:bg-slate-200 text-slate-500 transition-colors">{showNamingLogic ? <ChevronUp size={20} /> : <ChevronDown size={20} />}</button></div>
+                                                {showNamingLogic && (
+                                                    <div className="grid gap-3 max-w-3xl animate-in slide-in-from-top-2 fade-in duration-200">
+                                                        {namingPriority.map((type, idx) => {
+                                                            const config = { attribute: { key: 'useAttributes', label: 'Block Attributes', desc: 'Values from attributes like TAG, NAME, or ID.', icon: FileCode }, text: { key: 'useText', label: 'Text Labels', desc: 'Content of nearby Text or MText entities.', icon: FileText }, block: { key: 'useBlockNames', label: 'Block Names', desc: 'Name of the block reference (symbol) itself.', icon: Box }, layer: { key: 'useLayers', label: 'Layer Names', desc: 'Name of the layer containing the point.', icon: LayersIcon } }[type];
+                                                            const Icon = config.icon; const isFirst = idx === 0; const isLast = idx === namingPriority.length - 1; const isActive = mergeSettings[config.key];
+                                                            return ( <div key={type} className={`group relative flex items-center p-3 rounded-xl border transition-all duration-200 ${isActive ? 'bg-white border-indigo-200 shadow-sm' : 'bg-slate-100 border-transparent opacity-75'}`}><div className={`flex-none flex items-center justify-center w-8 h-8 rounded-lg text-sm font-bold mr-4 transition-colors ${isActive ? 'bg-indigo-50 text-indigo-600' : 'bg-slate-200 text-slate-400'}`}>{idx + 1}</div><div className="flex-1 min-w-0 mr-4"><div className="flex items-center gap-2 mb-0.5"><Icon size={14} className={isActive ? 'text-indigo-600' : 'text-slate-400'} /><span className={`text-sm font-semibold ${isActive ? 'text-slate-900' : 'text-slate-500'}`}>{config.label}</span></div><p className="text-xs text-slate-500 truncate">{config.desc}</p></div><div className="flex items-center gap-4"><div className="flex flex-col gap-1"><button onClick={(e) => { e.stopPropagation(); movePriority(idx, 'up'); }} disabled={isFirst} className={`p-1 rounded-md transition-all ${isFirst ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 hover:text-indigo-600 hover:bg-indigo-50'}`}><ChevronUp size={12} strokeWidth={3} /></button><button onClick={(e) => { e.stopPropagation(); movePriority(idx, 'down'); }} disabled={isLast} className={`p-1 rounded-md transition-all ${isLast ? 'text-slate-200 cursor-not-allowed' : 'text-slate-400 hover:text-indigo-600 hover:bg-indigo-50'}`}><ChevronDown size={12} strokeWidth={3} /></button></div><label className="relative inline-flex items-center cursor-pointer"><input type="checkbox" className="sr-only peer" checked={isActive} onChange={e => setMergeSettings(s => ({...s, [config.key]: e.target.checked}))} /><div className="w-11 h-6 bg-slate-200 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-indigo-600"></div></label></div></div> );
+                                                        })}
+                                                    </div>
+                                                )}
+                                            </div> 
+                                        )}
+                                    </div>
+
+                                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                        {/* PCS Table Controls */}
+                                        <div className="p-4 border-b border-slate-200 flex justify-between items-center bg-white">
+                                            <div className="flex items-center gap-4">
+                                                {selectedIds.size > 0 ? (
+                                                    <div className="flex items-center gap-3 animate-in fade-in zoom-in-95">
+                                                        <span className="text-sm font-bold text-blue-600">{selectedIds.size} Selected</span>
+                                                        {selectedIds.size >= 2 && ( <button onClick={handleManualMergeTrigger} className="flex items-center gap-2 bg-indigo-600 text-white px-3 py-1.5 rounded-lg text-sm font-bold hover:bg-indigo-700 shadow-sm"><Combine size={16} /> Merge</button> )}
+                                                        <button onClick={handleDeselectAll} className="flex items-center gap-1.5 bg-slate-100 hover:bg-slate-200 text-slate-600 px-3 py-1.5 rounded-lg text-sm font-medium transition-colors"><XCircle size={16}/> Clear</button>
+                                                    </div>
+                                                ) : (
+                                                    <>
+                                                        <span className="text-sm font-bold text-slate-700">{extractedPoints.length} Points Extracted</span>
+                                                        <button 
+                                                            onClick={handleFinalizePCS}
+                                                            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg text-sm font-bold shadow-md shadow-indigo-200 transition-all hover:scale-105"
+                                                        >
+                                                            Finalize & Convert <ArrowRight size={16} />
+                                                        </button>
+                                                    </>
+                                                )}
+                                            </div>
+                                            <div className="flex items-center gap-3">
+                                                <div className="flex items-center gap-1.5 px-1 py-1 rounded bg-slate-100 border border-slate-200">
+                                                    <button onClick={() => setViewMode('table')} className={`p-1.5 rounded ${viewMode === 'table' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}><List size={16}/></button>
+                                                    <button onClick={() => setViewMode('map')} className={`p-1.5 rounded ${viewMode === 'map' ? 'bg-white shadow-sm text-blue-600' : 'text-slate-400 hover:text-slate-600'}`}><LayoutGrid size={16}/></button>
+                                                </div>
+                                                <div className="flex items-center gap-2 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-200"><span className="text-xs text-slate-500 font-medium">Decimals:</span><input type="number" min="0" max="10" value={exportPrecision} onChange={(e) => setExportPrecision(Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))} className="w-8 text-xs font-mono text-center border-none bg-transparent focus:ring-0 text-slate-700 p-0" /></div>
+                                                <button onClick={() => handleExportXLSX(extractedPoints)} disabled={!isLibsReady} className={`flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-green-700 shadow-sm transition-all ${!isLibsReady ? 'opacity-50' : ''}`}><FileSpreadsheet size={16} /> Export</button>
+                                                {viewMode === 'table' && sortConfig.key && ( <button onClick={handleClearSort} className="p-2 text-slate-400 hover:text-red-500 rounded-full hover:bg-slate-100 transition-colors" title="Clear Sort"><XCircle size={18} /></button> )}
+                                            </div>
+                                        </div>
+
+                                        {/* PCS Table */}
+                                        {viewMode === 'table' ? (
+                                            <div className="overflow-x-auto max-h-[600px]">
+                                                <table className="w-full text-sm text-left">
+                                                    <thead className="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200 sticky top-0 z-10">
+                                                        <tr>
+                                                            <th className="w-10 px-4 py-4"><div className="flex items-center justify-center"><input type="checkbox" onChange={handleSelectAll} checked={sortedPoints.length > 0 && selectedIds.size === sortedPoints.length} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"/></div></th>
+                                                            <SortableHeader label="Marker Name" sortKey="name" />
+                                                            <SortableHeader label={mergeSettings.swapXY ? 'Northing (Y)' : 'Easting (X)'} sortKey="x" alignRight />
+                                                            <SortableHeader label={mergeSettings.swapXY ? 'Easting (X)' : 'Northing (Y)'} sortKey="y" alignRight />
+                                                            <SortableHeader label="Elevation (Z)" sortKey="z" alignRight />
+                                                            <SortableHeader label="Source" sortKey="source" />
+                                                            <th className="px-6 py-4 w-20">Actions</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100">
+                                                        {sortedPoints.map((p, index) => (
+                                                            <tr key={p.id} className={`group transition-colors ${selectedIds.has(p.id) ? 'bg-blue-50/50 hover:bg-blue-50' : 'hover:bg-slate-50'}`}>
+                                                                <td className="px-4 py-3 text-center"><input type="checkbox" checked={selectedIds.has(p.id)} onChange={() => handleSelect(p.id)} className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"/></td>
+                                                                {/* Editing Rows Logic (omitted for brevity, same as previous) */}
+                                                                {editingId === p.id ? (
+                                                                    <>
+                                                                        <td className="px-6 py-2"><input className="w-full p-1 border rounded focus:ring-2 focus:ring-blue-500 outline-none" value={editForm.name} onChange={e => setEditForm({...editForm, name: e.target.value})} /></td>
+                                                                        <td className="px-6 py-2"><input type="number" className="w-full p-1 border rounded text-right" value={editForm.x} onChange={e => setEditForm({...editForm, x: e.target.value})} /></td>
+                                                                        <td className="px-6 py-2"><input type="number" className="w-full p-1 border rounded text-right" value={editForm.y} onChange={e => setEditForm({...editForm, y: e.target.value})} /></td>
+                                                                        <td className="px-6 py-2"><input type="number" className="w-full p-1 border rounded text-right" value={editForm.z} onChange={e => setEditForm({...editForm, z: e.target.value})} /></td>
+                                                                        <td colSpan={2} className="px-6 py-2 flex gap-2 justify-end"><button onClick={saveEditing} className="p-1 bg-green-100 text-green-700 rounded"><Check size={16}/></button><button onClick={cancelEditing} className="p-1 bg-slate-100 text-slate-700 rounded"><X size={16}/></button></td>
+                                                                    </>
+                                                                ) : (
+                                                                    <>
+                                                                        <td className="px-6 py-3 font-medium text-slate-900">{p.name}<div className="text-[10px] text-slate-400 font-normal">{p.layer}</div></td>
+                                                                        <td className="px-6 py-3 text-right font-mono text-slate-600 bg-slate-50/30 group-hover:bg-transparent">{(p.x || 0).toFixed(exportPrecision)}</td>
+                                                                        <td className="px-6 py-3 text-right font-mono text-slate-600 bg-slate-50/30 group-hover:bg-transparent">{(p.y || 0).toFixed(exportPrecision)}</td>
+                                                                        <td className="px-6 py-3 text-right font-mono text-slate-600 bg-slate-50/30 group-hover:bg-transparent">{(p.z || 0).toFixed(exportPrecision)}</td>
+                                                                        <td className="px-6 py-3"><span className="inline-flex items-center px-2 py-1 rounded text-xs font-medium bg-slate-100 text-slate-600">{p.source}</span></td>
+                                                                        <td className="px-6 py-3 flex gap-1"><button onClick={() => startEditing(p)} className="p-1.5 text-slate-400 hover:text-blue-600 hover:bg-blue-50 rounded"><Edit2 size={16}/></button><button onClick={() => handleDelete(p.id)} className="p-1.5 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded"><Trash2 size={16}/></button></td>
+                                                                    </>
+                                                                )}
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        ) : (
+                                            <div className="p-4 bg-slate-100 border-t border-slate-200"><MapPreview points={extractedPoints} /></div>
+                                        )}
+                                    </div>
+                                </>
+                            )}
+                        </>
+                    )}
+
+                    {/* --- STAGE 2: GCS VIEW (New) --- */}
+                    {appStep === 'gcs' && (
+                        <div className="space-y-6 animate-in slide-in-from-right-4 fade-in duration-300">
+                            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                <div className="p-4 border-b border-slate-200 flex justify-between items-center bg-white">
+                                    <div className="flex items-center gap-4">
+                                        <span className="text-sm font-bold text-slate-700">Geodetic Results</span>
+                                        <span className="text-xs bg-green-100 text-green-800 px-2 py-1 rounded font-mono">WGS84</span>
+                                    </div>
+                                    <div className="flex items-center gap-3">
+                                        <div className="flex items-center gap-2 bg-slate-50 px-2 py-1.5 rounded-lg border border-slate-200"><span className="text-xs text-slate-500 font-medium">Decimals:</span><input type="number" min="0" max="10" value={exportPrecision} onChange={(e) => setExportPrecision(Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))} className="w-8 text-xs font-mono text-center border-none bg-transparent focus:ring-0 text-slate-700 p-0" /></div>
+                                        <button onClick={() => handleExportXLSX(convertedPoints)} disabled={!isLibsReady} className={`flex items-center gap-2 bg-green-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-green-700 shadow-sm transition-all ${!isLibsReady ? 'opacity-50' : ''}`}><FileSpreadsheet size={16} /> Export GCS XLSX</button>
+                                        <button onClick={() => setAppStep('map')} className="flex items-center gap-2 bg-indigo-600 text-white px-4 py-2 rounded-lg text-sm font-bold hover:bg-indigo-700 shadow-sm transition-all">Proceed to Grouping <ArrowRight size={16} /></button>
+                                    </div>
+                                </div>
+                                
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-sm text-left">
+                                        <thead className="bg-slate-50 text-slate-500 font-semibold border-b border-slate-200">
+                                            <tr>
+                                                <th className="px-6 py-4">Name</th>
+                                                <th className="px-6 py-4 text-right bg-indigo-50/30">Latitude (DMS)</th>
+                                                <th className="px-6 py-4 text-right bg-indigo-50/30">Longitude (DMS)</th>
+                                                <th className="px-6 py-4 text-right bg-orange-50/30">Altitude</th>
+                                                <th className="px-6 py-4 text-right opacity-50">Original X</th>
+                                                <th className="px-6 py-4 text-right opacity-50">Original Y</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-100">
+                                            {sortedPoints.map((p) => (
+                                                <tr key={p.id} className="hover:bg-slate-50">
+                                                    <td className="px-6 py-3 font-medium text-slate-900">{p.name}</td>
+                                                    <td className="px-6 py-3 text-right font-mono text-indigo-700 font-medium bg-indigo-50/10">{toDMS(p.lat, true)}</td>
+                                                    <td className="px-6 py-3 text-right font-mono text-indigo-700 font-medium bg-indigo-50/10">{toDMS(p.lon, false)}</td>
+                                                    <td className="px-6 py-3 text-right font-mono text-orange-700 bg-orange-50/10">{(p.z || 0).toFixed(exportPrecision)} m</td>
+                                                    <td className="px-6 py-3 text-right font-mono text-slate-400 text-xs opacity-70">{(p.x || 0).toFixed(2)}</td>
+                                                    <td className="px-6 py-3 text-right font-mono text-slate-400 text-xs opacity-70">{(p.y || 0).toFixed(2)}</td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {/* --- STAGE 3: MAP VISUALIZATION & GROUPING --- */}
+                    {appStep === 'map' && (
+                        <div className="space-y-6 animate-in slide-in-from-right-4 fade-in duration-300">
+                            {/* 1. Map Container */}
+                            <div id="map-container" className="w-full h-[500px] rounded-xl shadow-lg border border-slate-200 relative overflow-hidden bg-slate-100 z-0">
+                                {!isLibsReady && <div className="absolute inset-0 flex items-center justify-center text-slate-400">Loading Map...</div>}
+                            </div>
+
+                            {/* 2. Grouping & Export Control - REDESIGNED SPLIT VIEW */}
+                            <div className="grid md:grid-cols-3 gap-6">
+                                
+                                {/* LEFT COLUMN: FILE MANAGER */}
+                                <div className="md:col-span-1 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col h-[600px]">
+                                    <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                                        <h3 className="font-bold text-slate-700 text-sm flex items-center gap-2"><Files size={16} className="text-blue-600"/> KML Registry</h3>
+                                        {groupingFiles.length > 0 && <button onClick={() => { setGroupingFiles([]); setPointGroups({}); }} className="text-xs text-red-500 hover:underline">Clear All</button>}
+                                    </div>
+                                    
+                                    {/* Scrollable File List */}
+                                    <div className="flex-1 overflow-y-auto p-2 space-y-2 bg-slate-50/50">
+                                        <label className="flex flex-col items-center justify-center p-4 border-2 border-dashed border-blue-200 rounded-lg bg-blue-50/50 cursor-pointer hover:bg-blue-50 transition-colors">
+                                            <Upload size={20} className="text-blue-400 mb-2"/>
+                                            <span className="text-xs font-bold text-blue-700">Add KML Files</span>
+                                            <span className="text-[10px] text-blue-400 mt-1">Drag & Drop multiple</span>
+                                            <input type="file" accept=".kml" multiple className="hidden" onChange={(e) => handleGroupingKml(e.target.files)} />
+                                        </label>
+                                        
+                                        {groupingFiles.map((file, i) => (
+                                            <div key={i} className="flex items-center justify-between p-3 bg-white rounded border border-slate-200 shadow-sm group">
+                                                <div className="flex items-center gap-3 overflow-hidden">
+                                                    <div className="bg-green-100 p-1.5 rounded text-green-700"><MapIcon size={14}/></div>
+                                                    <div className="flex flex-col min-w-0">
+                                                        <span className="text-xs font-medium text-slate-700 truncate">{file.name}</span>
+                                                        <span className="text-[10px] text-slate-400">{(file.size/1024).toFixed(1)} KB</span>
+                                                    </div>
+                                                </div>
+                                                <button onClick={() => handleRemoveKml(i)} className="p-1 text-slate-300 hover:text-red-500 rounded"><X size={14}/></button>
+                                            </div>
+                                        ))}
+                                    </div>
+                                </div>
+
+                                {/* RIGHT COLUMN: TABS (Groups / All Points) */}
+                                <div className="md:col-span-2 bg-white rounded-xl shadow-sm border border-slate-200 flex flex-col h-[600px]">
+                                    <div className="flex border-b border-slate-200">
+                                        <button 
+                                            className={`flex-1 p-3 text-sm font-bold text-center ${viewMode === 'groups' ? 'text-indigo-600 border-b-2 border-indigo-600 bg-indigo-50/50' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}
+                                            onClick={() => setViewMode('groups')}
+                                        >
+                                            <span className="flex items-center justify-center gap-2"><FolderOpen size={16}/> Manage Groups</span>
+                                        </button>
+                                        <button 
+                                            className={`flex-1 p-3 text-sm font-bold text-center ${viewMode === 'all' ? 'text-blue-600 border-b-2 border-blue-600 bg-blue-50/50' : 'text-slate-500 hover:text-slate-700 hover:bg-slate-50'}`}
+                                            onClick={() => setViewMode('all')}
+                                        >
+                                            <span className="flex items-center justify-center gap-2"><ListChecks size={16}/> All Points (Master)</span>
+                                        </button>
+                                    </div>
+
+                                    {/* TAB CONTENT: GROUPS */}
+                                    {viewMode === 'groups' && (
+                                        <>
+                                            <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs font-mono bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full">{Object.keys(pointGroups).length} Groups</span>
+                                                    <button onClick={() => zoomToGroup()} className="text-xs bg-white border border-slate-200 px-2 py-1 rounded text-slate-600 hover:text-indigo-600 shadow-sm flex items-center gap-1"><Eye size={12}/> Zoom to All</button>
+                                                </div>
+                                                <button onClick={autoSelectFirst3} className="text-xs bg-white border border-slate-200 px-2 py-1 rounded text-slate-600 hover:text-indigo-600 shadow-sm flex items-center gap-1"><ListChecks size={12}/> Reset Perm. to First 3</button>
+                                            </div>
+
+                                            <div className="flex-1 overflow-y-auto p-4 space-y-3 bg-slate-50/30">
+                                                {Object.keys(pointGroups).length === 0 ? (
+                                                    <div className="h-full flex flex-col items-center justify-center text-slate-400 space-y-4">
+                                                        <div className="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center"><FolderOpen size={32} className="opacity-20"/></div>
+                                                        <div className="text-center">
+                                                            <p className="text-sm font-medium">No Groups Created Yet</p>
+                                                            <p className="text-xs max-w-xs mx-auto mt-1">Upload KMLs or create custom groups from the "All Points" tab.</p>
+                                                        </div>
+                                                    </div>
+                                                ) : (
+                                                    Object.entries(pointGroups).map(([groupName, points]) => (
+                                                        <div key={groupName} className="bg-white rounded-lg border border-slate-200 shadow-sm overflow-hidden">
+                                                            <div 
+                                                                className="flex items-center justify-between p-3 cursor-pointer hover:bg-slate-50 transition-colors bg-gradient-to-r from-slate-50 to-white"
+                                                                onClick={() => toggleGroupExpand(groupName)}
+                                                            >
+                                                                <div className="flex items-center gap-3">
+                                                                    <button className="text-slate-400">
+                                                                        {expandedGroups.has(groupName) ? <ChevronDown size={16}/> : <ChevronRight size={16}/>}
+                                                                    </button>
+                                                                    <FolderOpen size={16} className="text-indigo-500"/>
+                                                                    <span className="text-sm font-bold text-slate-800 truncate max-w-[200px]">{groupName}</span>
+                                                                    <button onClick={(e) => { e.stopPropagation(); zoomToGroup(groupName); }} className="text-slate-400 hover:text-blue-500 ml-2" title="Zoom to group"><Eye size={14}/></button>
+                                                                </div>
+                                                                <div className="flex items-center gap-2">
+                                                                    <div className="flex items-center gap-1 text-[10px] bg-green-50 text-green-700 px-2 py-0.5 rounded border border-green-100">
+                                                                        <CheckCircle size={10}/>
+                                                                        <span className="font-bold">{permanentSelection[groupName]?.size || 0}</span>
+                                                                    </div>
+                                                                    <div className="flex items-center gap-1 text-[10px] bg-red-50 text-red-700 px-2 py-0.5 rounded border border-red-100">
+                                                                        <Ban size={10}/>
+                                                                        <span className="font-bold">{excludedSelection[groupName]?.size || 0}</span>
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                            
+                                                            {expandedGroups.has(groupName) && (
+                                                                <div className="border-t border-slate-100 p-3 bg-slate-50/50">
+                                                                    <div className="text-xs font-bold text-slate-400 mb-2 uppercase tracking-wide">Active Points</div>
+                                                                    <div className="grid grid-cols-2 gap-2 mb-4">
+                                                                        {points.filter(p => !excludedSelection[groupName]?.has(p.id)).map(p => (
+                                                                            <div key={p.id} className="flex items-center justify-between p-2 rounded border bg-white border-slate-200 text-xs shadow-sm hover:border-indigo-200 transition-all group">
+                                                                                <label className="flex items-center gap-2 cursor-pointer flex-1 min-w-0">
+                                                                                    <input 
+                                                                                        type="checkbox" 
+                                                                                        className="accent-indigo-600 w-3.5 h-3.5 rounded-sm" 
+                                                                                        checked={permanentSelection[groupName]?.has(p.id) || false} 
+                                                                                        onChange={() => togglePermanent(groupName, p.id)} 
+                                                                                    />
+                                                                                    <span className="truncate font-medium text-slate-700">{p.name}</span>
+                                                                                </label>
+                                                                                <button onClick={() => toggleExcluded(groupName, p.id)} className="text-slate-300 hover:text-red-500 opacity-0 group-hover:opacity-100 transition-opacity" title="Exclude from Group"><Trash2 size={12}/></button>
+                                                                            </div>
+                                                                        ))}
+                                                                    </div>
+                                                                    {(excludedSelection[groupName]?.size > 0) && (
+                                                                        <div className="mt-2 border-t border-slate-200 pt-2">
+                                                                            <div className="text-xs font-bold text-red-300 mb-2 uppercase tracking-wide flex items-center gap-1"><Ban size={10}/> Excluded</div>
+                                                                            <div className="grid grid-cols-2 gap-2">
+                                                                                {points.filter(p => excludedSelection[groupName]?.has(p.id)).map(p => (
+                                                                                    <div key={p.id} className="flex items-center justify-between p-2 rounded border border-red-100 bg-red-50/50 text-xs opacity-60 hover:opacity-100 transition-all">
+                                                                                        <span className="truncate font-medium text-red-800 line-through decoration-red-300">{p.name}</span>
+                                                                                        <button onClick={() => toggleExcluded(groupName, p.id)} className="text-red-400 hover:text-green-600" title="Restore"><Undo2 size={12}/></button>
+                                                                                    </div>
+                                                                                ))}
+                                                                            </div>
+                                                                        </div>
+                                                                    )}
+                                                                </div>
+                                                            )}
+                                                        </div>
+                                                    ))
+                                                )}
+                                            </div>
+                                            
+                                            <div className="p-4 border-t border-slate-200 bg-white flex justify-end">
+                                                <button onClick={handleLegalExport} disabled={Object.keys(pointGroups).length === 0} className={`flex items-center gap-2 bg-indigo-600 text-white px-6 py-2.5 rounded-lg text-sm font-bold shadow-lg shadow-indigo-200 transition-all ${Object.keys(pointGroups).length === 0 ? 'opacity-50 cursor-not-allowed' : 'hover:scale-105 hover:bg-indigo-700'}`}><Package size={18}/> Download Legal Package</button>
+                                            </div>
+                                        </>
+                                    )}
+
+                                    {/* TAB CONTENT: ALL POINTS (MASTER LIST) */}
+                                    {viewMode === 'all' && (
+                                        <>
+                                            <div className="p-4 border-b border-slate-100 bg-slate-50 flex justify-between items-center">
+                                                <div className="flex items-center gap-2">
+                                                    <span className="text-xs font-mono bg-blue-100 text-blue-700 px-2 py-0.5 rounded-full">{convertedPoints.length} Total Points</span>
+                                                </div>
+                                                <div className="flex items-center gap-2">
+                                                    <button onClick={handleSelectAllForGroup} className="text-xs text-blue-600 hover:underline">Select All</button>
+                                                    <span className="text-slate-300">|</span>
+                                                    <button onClick={() => setSelectionForGroup(new Set())} className="text-xs text-slate-500 hover:text-slate-700">Clear</button>
+                                                </div>
+                                            </div>
+                                            <div className="flex-1 overflow-y-auto">
+                                                <table className="w-full text-xs text-left">
+                                                    <thead className="bg-slate-50 text-slate-500 font-semibold sticky top-0 z-10 shadow-sm">
+                                                        <tr>
+                                                            <th className="w-8 px-3 py-2 text-center">
+                                                                <input type="checkbox" onChange={(e) => e.target.checked ? handleSelectAllForGroup() : setSelectionForGroup(new Set())} checked={selectionForGroup.size === convertedPoints.length && convertedPoints.length > 0} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500"/>
+                                                            </th>
+                                                            <th className="px-3 py-2">Name</th>
+                                                            <th className="px-3 py-2 text-right">Lat/Lon</th>
+                                                            <th className="px-3 py-2 text-right">E/N</th>
+                                                            <th className="px-3 py-2 text-right">Alt</th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody className="divide-y divide-slate-100 bg-white">
+                                                        {convertedPoints.map(p => (
+                                                            <tr key={p.id} className={`hover:bg-blue-50 transition-colors ${selectionForGroup.has(p.id) ? 'bg-blue-50/50' : ''}`}>
+                                                                <td className="px-3 py-2 text-center">
+                                                                    <input type="checkbox" checked={selectionForGroup.has(p.id)} onChange={() => togglePointForGroup(p.id)} className="rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"/>
+                                                                </td>
+                                                                <td className="px-3 py-2 font-medium text-slate-700">{p.name}</td>
+                                                                <td className="px-3 py-2 text-right font-mono text-slate-500">
+                                                                    {p.lat.toFixed(5)}, {p.lon.toFixed(5)}
+                                                                </td>
+                                                                <td className="px-3 py-2 text-right font-mono text-slate-500">
+                                                                    {p.x.toFixed(2)}, {p.y.toFixed(2)}
+                                                                </td>
+                                                                <td className="px-3 py-2 text-right font-mono text-slate-500">{p.z.toFixed(2)}</td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                            <div className="p-4 border-t border-slate-200 bg-white flex justify-between items-center">
+                                                <span className="text-xs font-bold text-blue-600">{selectionForGroup.size} Selected</span>
+                                                <button 
+                                                    onClick={() => setIsCustomGroupModalOpen(true)} 
+                                                    disabled={selectionForGroup.size === 0} 
+                                                    className={`flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg text-xs font-bold shadow-md transition-all ${selectionForGroup.size === 0 ? 'opacity-50 cursor-not-allowed' : 'hover:bg-blue-700 hover:shadow-lg'}`}
+                                                >
+                                                    <Plus size={14}/> Create Group from Selection
+                                                </button>
+                                            </div>
+                                        </>
+                                    )}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                </div>
+                
+                {/* Modals */}
+                {isMergeModalOpen && (
+                    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                            <div className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[80vh] flex flex-col">
+                                <div className="p-6 border-b border-slate-200 flex justify-between items-center bg-slate-50 rounded-t-xl"><div><h2 className="text-xl font-bold text-slate-900 flex items-center gap-2"><Combine className="text-indigo-600"/> Merge Conflict Resolver</h2><p className="text-sm text-slate-500 mt-1">Select values.</p></div><button onClick={() => setIsMergeModalOpen(false)} className="text-slate-400 hover:text-slate-600"><X size={24}/></button></div>
+                                <div className="flex-1 overflow-auto p-0"><table className="w-full text-sm text-left border-collapse"><thead className="bg-slate-50 text-slate-500 sticky top-0 z-10 shadow-sm"><tr><th className="px-6 py-3 font-semibold w-24">ID</th><th className="px-6 py-3 font-semibold">Name</th><th className="px-6 py-3 font-semibold text-right">X</th><th className="px-6 py-3 font-semibold text-right">Y</th><th className="px-6 py-3 font-semibold text-right">Z</th><th className="px-6 py-3 font-semibold">Layer</th></tr></thead><tbody className="divide-y divide-slate-100">{mergeCandidates.map(c => (<tr key={c.id} className="hover:bg-slate-50"><td className="px-6 py-3 font-mono text-slate-400">#{c.id}</td><td className={`px-6 py-3 cursor-pointer border-l-4 ${mergeSelection.name === c.id ? 'bg-indigo-50 border-indigo-500 text-indigo-700 font-bold' : 'border-transparent hover:bg-slate-100'}`} onClick={() => setMergeSelection(s => ({...s, name: c.id}))}>{c.name}</td><td className={`px-6 py-3 text-right font-mono cursor-pointer border-l-4 ${mergeSelection.x === c.id ? 'bg-blue-50 border-blue-500 text-blue-700 font-bold' : 'border-transparent hover:bg-slate-100'}`} onClick={() => setMergeSelection(s => ({...s, x: c.id}))}>{(c.x||0).toFixed(exportPrecision)}</td><td className={`px-6 py-3 text-right font-mono cursor-pointer border-l-4 ${mergeSelection.y === c.id ? 'bg-blue-50 border-blue-500 text-blue-700 font-bold' : 'border-transparent hover:bg-slate-100'}`} onClick={() => setMergeSelection(s => ({...s, y: c.id}))}>{(c.y||0).toFixed(exportPrecision)}</td><td className={`px-6 py-3 text-right font-mono cursor-pointer border-l-4 ${mergeSelection.z === c.id ? 'bg-blue-50 border-blue-500 text-blue-700 font-bold' : 'border-transparent hover:bg-slate-100'}`} onClick={() => setMergeSelection(s => ({...s, z: c.id}))}>{(c.z||0).toFixed(exportPrecision)}</td><td className={`px-6 py-3 cursor-pointer border-l-4 ${mergeSelection.layer === c.id ? 'bg-slate-100 border-slate-500 text-slate-900 font-bold' : 'border-transparent hover:bg-slate-100'}`} onClick={() => setMergeSelection(s => ({...s, layer: c.id}))}>{c.layer}</td></tr>))}</tbody></table></div>
+                                <div className="p-6 border-t border-slate-200 bg-slate-50 rounded-b-xl flex justify-between items-center">
+                                    <div className="text-xs text-slate-500">
+                                        <span className="font-bold uppercase tracking-wider block mb-1">Preview Result</span>
+                                        <div className="font-mono text-slate-700">
+                                            <span className="font-bold text-indigo-700">{mergeCandidates.find(c => c.id === mergeSelection.name)?.name || "?"}</span>
+                                            <span className="mx-2 text-slate-300">|</span>
+                                            X: {(mergeCandidates.find(c => c.id === mergeSelection.x)?.x || 0).toFixed(exportPrecision)}
+                                            <span className="mx-2 text-slate-300">|</span>
+                                            Y: {(mergeCandidates.find(c => c.id === mergeSelection.y)?.y || 0).toFixed(exportPrecision)}
+                                            <span className="mx-2 text-slate-300">|</span>
+                                            Z: {(mergeCandidates.find(c => c.id === mergeSelection.z)?.z || 0).toFixed(exportPrecision)}
+                                            <span className="mx-2 text-slate-300">|</span>
+                                            <span className="text-slate-500">{mergeCandidates.find(c => c.id === mergeSelection.layer)?.layer || "?"}</span>
+                                        </div>
+                                    </div>
+                                    <div className="flex gap-3"><button onClick={() => setIsMergeModalOpen(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-200 rounded-lg font-medium">Cancel</button><button onClick={applyManualMerge} className="px-6 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg font-bold shadow-sm flex items-center gap-2"><Check size={18} /> Confirm</button></div>
+                                </div>
+                            </div>
+                    </div>
+                )}
+                
+                {/* Custom Group Modal */}
+                {isCustomGroupModalOpen && (
+                    <div className="fixed inset-0 bg-black/50 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+                        <div className="bg-white rounded-xl shadow-2xl w-full max-w-md p-6">
+                            <h3 className="text-lg font-bold text-slate-800 mb-4 flex items-center gap-2"><FolderOpen className="text-blue-600"/> Create Custom Group</h3>
+                            <div className="space-y-4">
+                                <div>
+                                    <label className="block text-sm font-medium text-slate-700 mb-1">Group Name</label>
+                                    <input 
+                                        type="text" 
+                                        className="w-full p-2 border border-slate-300 rounded focus:ring-2 focus:ring-blue-500 outline-none" 
+                                        placeholder="e.g. Boundary Markers" 
+                                        value={newGroupName} 
+                                        onChange={(e) => setNewGroupName(e.target.value)}
+                                        autoFocus
+                                    />
+                                </div>
+                                <div className="text-sm text-slate-500">
+                                    Creating group with <strong>{selectionForGroup.size}</strong> selected points.
+                                </div>
+                                <div className="flex justify-end gap-3 pt-2">
+                                    <button onClick={() => setIsCustomGroupModalOpen(false)} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded">Cancel</button>
+                                    <button onClick={handleCreateCustomGroup} disabled={!newGroupName.trim()} className="px-6 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded font-bold shadow-sm disabled:opacity-50">Create</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                </div>
+            );
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
