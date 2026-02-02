@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>360° SURVEY MARKER EXTRACTOR</title>
+    <title>Metashape Marker Extractor & GCS Converter</title>
     
     <!-- 1. Styles -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -41,7 +41,8 @@
     <!-- 2. Core Libraries -->
     <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
     <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <!-- FIX: Pinned Babel version to avoid configuration regressions -->
+    <script src="https://unpkg.com/@babel/standalone@7.23.6/babel.min.js"></script>
 
     <!-- 3. Utility Libraries -->
     <script src="https://cdn.sheetjs.com/xlsx-0.20.0/package/dist/xlsx.full.min.js"></script>
@@ -56,7 +57,8 @@
     <div id="root"></div>
 
     <!-- 4. The Application Logic -->
-    <script type="text/babel" data-type="module">
+    <!-- FIX: Added data-presets="react" to explicitly define transformation targets -->
+    <script type="text/babel" data-type="module" data-presets="react">
         import { 
             Upload, FileText, Download, AlertCircle, MapPin, Database, Trash2, 
             CheckCircle, Info, Layers, LayoutGrid, List, Settings, Globe, Box, 
